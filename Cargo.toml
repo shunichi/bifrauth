@@ -18,3 +18,12 @@ edition = "2024"
 rust-version = "1.97"
 license = "MIT"
 repository = "https://github.com/shunichi/bifrauth"
+
+# 依存の版はワークスペースで一元管理する（計画 §3）。各クレートは workspace = true で参照する。
+# 版は cargo add 等で解決した最新安定版を明示する（CLAUDE.md のライブラリ方針）。
+[workspace.dependencies]
+unicode-normalization = "0.1.25"
+ed25519-dalek = "3.0.0"
+p256 = "0.14.0"
+sha2 = "0.11.0"
+getrandom = "0.4.3"

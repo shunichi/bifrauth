@@ -13,8 +13,11 @@ pub enum Error {
     BadPublicKey,
     /// 署名のバイト列/DER が不正（形式・長さ・r,s 範囲）。
     BadSignature,
-    /// 署名検証に失敗（不一致）。
+    /// 署名検証に失敗（不一致、small-order/malleability を含む）。
     VerifyFailed,
+    /// OS 乱数源の取得に失敗。呼び出し側は認証失敗として扱い（password フォールバック等）、
+    /// **プロセスを panic させない**。
+    RandomFailed,
 }
 
 /// `SHA-256(data)`。
@@ -28,7 +31,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 pub mod ed25519 {
     //! Ed25519（verifier の challenge 署名）。
     use super::Error;
-    use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+    use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
     /// 32B の秘密鍵シードから署名鍵を作る。
     pub fn signing_key(seed: &[u8; 32]) -> SigningKey {
@@ -45,11 +48,15 @@ pub mod ed25519 {
         sk.sign(msg).to_bytes()
     }
 
-    /// 32B 公開鍵で `msg` に対する 64B 署名を検証する。
+    /// 32B 公開鍵で `msg` に対する 64B 署名を **strict** 検証する。
+    ///
+    /// `verify_strict` は R と公開鍵の small-order/group-element malleability も拒否する
+    /// （認証の検証境界は strict を選ぶ）。
     pub fn verify(pk: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> Result<(), Error> {
         let vk = VerifyingKey::from_bytes(pk).map_err(|_| Error::BadPublicKey)?;
         let signature = Signature::from_bytes(sig);
-        vk.verify(msg, &signature).map_err(|_| Error::VerifyFailed)
+        vk.verify_strict(msg, &signature)
+            .map_err(|_| Error::VerifyFailed)
     }
 }
 
@@ -73,23 +80,77 @@ pub mod p256_ecdsa {
 
 pub mod csprng {
     //! CSPRNG（設計 §16）。OS の暗号乱数（`getrandom`）を使う。
+    //!
+    //! 乱数源障害は **panic させず** [`Error::RandomFailed`] を返す。呼び出し側（verifier/PAM）は
+    //! 認証失敗として扱い、password フォールバックへ落とす（DoS を避ける）。
+    use super::Error;
+
+    /// 剰余バイアス排除の上限（受理個数 4,294,000,000 は 1,000,000 の倍数）。
+    const CC_LIMIT: u32 = u32::MAX - (u32::MAX % 1_000_000);
 
     /// N バイトの暗号乱数。
-    pub fn random_bytes<const N: usize>() -> [u8; N] {
+    pub fn random_bytes<const N: usize>() -> Result<[u8; N], Error> {
         let mut b = [0u8; N];
-        getrandom::fill(&mut b).expect("OS CSPRNG");
-        b
+        getrandom::fill(&mut b).map_err(|_| Error::RandomFailed)?;
+        Ok(b)
     }
 
-    /// 一様な 6 桁の確認コード（`[0-9]{6}`, 000000..=999999）。
-    pub fn confirmation_code() -> String {
-        // 剰余バイアスを避けるため rejection sampling。
-        const LIMIT: u32 = u32::MAX - (u32::MAX % 1_000_000);
+    /// 一様な 6 桁の確認コード（`[0-9]{6}`, 000000..=999999）。乱数障害時は `RandomFailed`。
+    pub fn confirmation_code() -> Result<String, Error> {
+        confirmation_code_with(|b| getrandom::fill(b).map_err(|_| Error::RandomFailed))
+    }
+
+    /// テスト可能なコア。`fill` を注入して rejection 分岐と乱数障害を決定論的に検証できる。
+    /// rejection sampling で 000000..=999999 を一様に生成する。
+    fn confirmation_code_with<F>(mut fill: F) -> Result<String, Error>
+    where
+        F: FnMut(&mut [u8; 4]) -> Result<(), Error>,
+    {
         loop {
-            let v = u32::from_le_bytes(random_bytes::<4>());
-            if v < LIMIT {
-                return format!("{:06}", v % 1_000_000);
+            let mut buf = [0u8; 4];
+            fill(&mut buf)?;
+            let v = u32::from_le_bytes(buf);
+            if v < CC_LIMIT {
+                return Ok(format!("{:06}", v % 1_000_000));
             }
+            // v >= CC_LIMIT は棄却してやり直す（バイアス排除）。
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn rejects_biased_region_then_accepts() {
+            // 1回目は棄却域（CC_LIMIT）、2回目は 123456 になる値を返す決定論的 fill。
+            let mut calls = 0u32;
+            let code = confirmation_code_with(|b| {
+                calls += 1;
+                let v: u32 = if calls == 1 { CC_LIMIT } else { 123_456 };
+                *b = v.to_le_bytes();
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(code, "123456");
+            assert_eq!(calls, 2, "棄却域を1回スキップしてから採用する");
+        }
+
+        #[test]
+        fn propagates_random_failure() {
+            let r = confirmation_code_with(|_| Err(Error::RandomFailed));
+            assert_eq!(r, Err(Error::RandomFailed));
+        }
+
+        #[test]
+        fn code_is_zero_padded_six_digits() {
+            // v=5 → "000005"
+            let code = confirmation_code_with(|b| {
+                *b = 5u32.to_le_bytes();
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(code, "000005");
         }
     }
 }
@@ -128,6 +189,28 @@ mod tests {
     }
 
     #[test]
+    fn ed25519_small_order_pubkeys_rejected() {
+        // 既知の small-order point エンコード（strict 検証で拒否される。panic しない）。
+        let small_order: [[u8; 32]; 3] = [
+            [0u8; 32], // order 4
+            {
+                let mut a = [0u8; 32];
+                a[0] = 1; // identity (order 1)
+                a
+            },
+            [
+                0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0x7f,
+            ], // p-1 相当の small-order 点
+        ];
+        let sig = [0u8; 64];
+        for pk in &small_order {
+            assert!(ed25519::verify(pk, b"m", &sig).is_err());
+        }
+    }
+
+    #[test]
     fn p256_verify_roundtrip_and_rejections() {
         use p256::ecdsa::signature::Signer;
         use p256::ecdsa::{Signature, SigningKey};
@@ -159,9 +242,59 @@ mod tests {
     }
 
     #[test]
+    fn p256_negative_der_regression() {
+        use p256::ecdsa::signature::Signer;
+        use p256::ecdsa::{Signature, SigningKey};
+
+        let sk = SigningKey::from_slice(&[0x11u8; 32]).unwrap();
+        let sec1 = sk.verifying_key().to_sec1_bytes();
+        let msg = b"m";
+        let sig: Signature = sk.sign(msg);
+        let valid: Vec<u8> = sig.to_der().as_bytes().to_vec();
+        // 正当署名は通ることを前提にする（回帰の基準）。
+        assert!(p256_ecdsa::verify(&sec1, msg, &valid).is_ok());
+
+        // (a) trailing bytes
+        let mut trailing = valid.clone();
+        trailing.push(0xAA);
+        // (b) truncated
+        let truncated = &valid[..valid.len() - 1];
+        // (c) SEQUENCE ではなく INTEGER
+        let not_seq: &[u8] = &[0x02, 0x01, 0x01];
+        // (d) r=0: SEQUENCE{ INT 0, INT 1 }
+        let r_zero: &[u8] = &[0x30, 0x06, 0x02, 0x01, 0x00, 0x02, 0x01, 0x01];
+        // (e) s=0
+        let s_zero: &[u8] = &[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00];
+        // (f) 非最小の long-form 長（本体6Bを 0x81 0x06 で表す）
+        let nonminimal_len: &[u8] = &[0x30, 0x81, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+        // (g) INTEGER に不要な leading 00（r = 00 01）
+        let leading_zero: &[u8] = &[0x30, 0x07, 0x02, 0x02, 0x00, 0x01, 0x02, 0x01, 0x01];
+        // (h) 負の INTEGER（先頭 0x80、leading 00 なし）
+        let negative_int: &[u8] = &[0x30, 0x06, 0x02, 0x01, 0x80, 0x02, 0x01, 0x01];
+
+        for (name, der) in [
+            ("trailing", trailing.as_slice()),
+            ("truncated", truncated),
+            ("not_seq", not_seq),
+            ("r_zero", r_zero),
+            ("s_zero", s_zero),
+            ("nonminimal_len", nonminimal_len),
+            ("leading_zero", leading_zero),
+            ("negative_int", negative_int),
+        ] {
+            assert_eq!(
+                p256_ecdsa::verify(&sec1, msg, der),
+                Err(Error::BadSignature),
+                "case {name} must be BadSignature"
+            );
+        }
+    }
+
+    #[test]
     fn csprng_confirmation_code_shape() {
+        // 形状のみ（一様性の証明は csprng::tests の決定論境界テストで担保）。
         for _ in 0..100 {
-            let c = csprng::confirmation_code();
+            let c = csprng::confirmation_code().unwrap();
             assert_eq!(c.len(), 6);
             assert!(c.bytes().all(|b| b.is_ascii_digit()));
         }
@@ -169,8 +302,8 @@ mod tests {
 
     #[test]
     fn csprng_random_bytes_differ() {
-        let a: [u8; 16] = csprng::random_bytes();
-        let b: [u8; 16] = csprng::random_bytes();
+        let a: [u8; 16] = csprng::random_bytes().unwrap();
+        let b: [u8; 16] = csprng::random_bytes().unwrap();
         assert_ne!(a, b); // 衝突は事実上起きない
     }
 }

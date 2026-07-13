@@ -6,10 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-ed25519-dalek = "3.0.0"
-getrandom = "0.4.3"
-p256 = "0.14.0"
-sha2 = "0.11.0"
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
+p256 = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 bifrauth-proto = { path = "../bifrauth-proto" }

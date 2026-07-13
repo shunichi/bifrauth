@@ -1,3 +1,7 @@
+# Rust
+/target
+**/*.rs.bk
+
 # エージェントのローカル設定（マシン固有の絶対パスを含み、共有対象外）
 # agmsg が delivery mode 設定時に生成するフック設定
 .codex/hooks.json

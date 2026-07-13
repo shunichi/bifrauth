@@ -12,8 +12,23 @@ assigned_in_17_088F	unassigned	088F	U+088F（16.0 では Cn。17.0 で割当 →
 private_use_co_e000	ok	E000	U+E000（Private Use = Co）。Cn のみ拒否のため受理される証拠
 noncharacter_fffe	unassigned	FFFE	U+FFFE（非文字 = Cn）
 noncharacter_fdd0	unassigned	FDD0	U+FDD0（非文字 = Cn）
-bidi_rlo_202e	bad_text	202E	U+202E RIGHT-TO-LEFT OVERRIDE（Bidi_Control）
-bidi_alm_061c	bad_text	061C	U+061C ARABIC LETTER MARK（Bidi_Control 境界）
+# Bidi_Control 全 12 個を negative に列挙（Swift 転記漏れ防止）。
+bidi_061c	bad_text	061C	U+061C ARABIC LETTER MARK
+bidi_200e	bad_text	200E	U+200E LEFT-TO-RIGHT MARK
+bidi_200f	bad_text	200F	U+200F RIGHT-TO-LEFT MARK
+bidi_202a	bad_text	202A	U+202A LEFT-TO-RIGHT EMBEDDING
+bidi_202b	bad_text	202B	U+202B RIGHT-TO-LEFT EMBEDDING
+bidi_202c	bad_text	202C	U+202C POP DIRECTIONAL FORMATTING
+bidi_202d	bad_text	202D	U+202D LEFT-TO-RIGHT OVERRIDE
+bidi_202e	bad_text	202E	U+202E RIGHT-TO-LEFT OVERRIDE
+bidi_2066	bad_text	2066	U+2066 LEFT-TO-RIGHT ISOLATE
+bidi_2067	bad_text	2067	U+2067 RIGHT-TO-LEFT ISOLATE
+bidi_2068	bad_text	2068	U+2068 FIRST STRONG ISOLATE
+bidi_2069	bad_text	2069	U+2069 POP DIRECTIONAL ISOLATE
 c0_nul_0000	bad_text	0000	U+0000 NUL（C0）
 c1_lower_0080	bad_text	0080	U+0080（C1 下端）
 c1_upper_009f	bad_text	009F	U+009F（C1 上端）
+# 制御境界の受理側も固定（現 spec は C0=0000..001F と C1=0080..009F のみ拒否）。
+boundary_space_0020	ok	0020	U+0020 SPACE（C0 直後、受理）
+boundary_del_007f	ok	007F	U+007F DELETE（C0/C1 の範囲外 = 現 spec では受理。意図的）
+boundary_nbsp_00a0	ok	00A0	U+00A0 NO-BREAK SPACE（C1 直後、受理。NFC で不変）

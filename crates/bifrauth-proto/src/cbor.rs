@@ -139,7 +139,9 @@ fn encode_value(out: &mut Vec<u8>, v: &Value) {
             encode_head(out, 5, entries.len() as u64);
             let mut idx: Vec<usize> = (0..entries.len()).collect();
             idx.sort_by_key(|&i| entries[i].0);
-            debug_assert!(
+            // release でも有効な assert。schema エンコーダは 0..N-1 の一意キーを構築するため
+            // 通常フローで発火しない不変条件。黙って dedup すると非 canonical 出力になるため panic で防ぐ。
+            assert!(
                 idx.windows(2).all(|w| entries[w[0]].0 < entries[w[1]].0),
                 "encode: map keys must be unique and this crate must only encode schema-built maps",
             );

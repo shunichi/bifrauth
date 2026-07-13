@@ -2,7 +2,7 @@
 //!
 //! 規範は `spec/cbor-profile.md` §4（challenge.v1）/§5（response.v1）/§6（envelope.v1）。
 //! 層A（[`crate::cbor`]）で canonical と判定された `Value` に対し、キー全必須・exact/範囲を検査する。
-//! 各スキーマはキー 0..N-1 の連番 map なので、`cbor::scan` が保証する「昇順・一意キー」と合わせ、
+//! 各スキーマはキー 0..N-1 の連番 map なので、`cbor::scan_structure` が保証する「昇順・一意キー」と合わせ、
 //! 「エントリ数 == N かつ i 番目のキー == i」で余分/欠損/重複/順序違反をまとめて排除する。
 //!
 //! **未実装（依存判断を保留）:** テキストの NFC 正規化検査と「未割当 code point 拒否」は
@@ -222,88 +222,99 @@ fn challenge_limits() -> Limits {
 }
 
 impl Challenge {
-    /// canonical バイト列を検証して復元する（層A + 層B）。
+    /// 全フィールドの層B 制約を検査する（decode 後と encode 前の両方で必ず呼ぶ）。
+    /// **暗黙の正規化はしない** — 違反は Err にする。
+    pub fn validate(&self) -> Result<(), SchemaError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(SchemaError::OutOfRange { key: 1 });
+        }
+        // exact byte 長は型（[u8; N]）が保証する。
+        TextPolicy::check(&self.linux_device_name, 6, 1, MAX_DEVICE_NAME, false)?;
+        if self.target_uid as u64 > UID_MAX {
+            return Err(SchemaError::OutOfRange { key: 7 });
+        }
+        TextPolicy::check(&self.target_username, 8, 1, MAX_USERNAME, false)?;
+        TextPolicy::check(&self.pam_service, 9, 1, MAX_PAM_SERVICE, false)?;
+        if let Some(s) = &self.pam_tty {
+            TextPolicy::check(s, 10, 1, MAX_PAM_TTY_RHOST, false)?;
+        }
+        if let Some(s) = &self.pam_rhost {
+            TextPolicy::check(s, 11, 1, MAX_PAM_TTY_RHOST, false)?;
+        }
+        TextPolicy::check(&self.requested_action, 12, 1, MAX_REQUESTED_ACTION, false)?;
+        if self.issued_at > EPOCH_MAX {
+            return Err(SchemaError::OutOfRange { key: 13 });
+        }
+        if self.expires_at > EPOCH_MAX {
+            return Err(SchemaError::OutOfRange { key: 14 });
+        }
+        if self.expires_at <= self.issued_at {
+            return Err(SchemaError::TtlOutOfRange);
+        }
+        let ttl = self.expires_at - self.issued_at;
+        if !(TTL_MIN..=TTL_MAX).contains(&ttl) {
+            return Err(SchemaError::TtlOutOfRange);
+        }
+        // confirmation_code: ASCII [0-9]{6} exact。
+        if self.confirmation_code.len() != 6
+            || !self.confirmation_code.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(SchemaError::BadText { key: 15 });
+        }
+        Ok(())
+    }
+
+    /// canonical バイト列を検証して復元する（層A + 型抽出 + 層B `validate`）。
     pub fn decode(bytes: &[u8]) -> Result<Challenge, SchemaError> {
         let v = cbor::scan_structure(bytes, challenge_limits())?;
         let e = map_entries(&v, 16)?;
 
+        // 型・exact byte 長・固定文字列の抽出（構造）。
         expect_fixed(&e[0].1, 0, MESSAGE_TYPE_CHALLENGE)?;
         let protocol_version = take_uint(&e[1].1, 1)?;
-        if protocol_version != PROTOCOL_VERSION {
-            return Err(SchemaError::OutOfRange { key: 1 });
-        }
         let request_id = take_bytes_exact::<16>(&e[2].1, 2)?;
         let nonce = take_bytes_exact::<16>(&e[3].1, 3)?;
         let verifier_key_id = take_bytes_exact::<32>(&e[4].1, 4)?;
         let linux_device_id = take_bytes_exact::<16>(&e[5].1, 5)?;
-
-        let linux_device_name = take_text(&e[6].1, 6)?;
-        TextPolicy::check(linux_device_name, 6, 1, MAX_DEVICE_NAME, false)?;
-
+        let linux_device_name = take_text(&e[6].1, 6)?.to_owned();
+        // uid は u32 へ格納するため、範囲外はここで拒否してから構築する（validate でも再検査）。
         let uid = take_uint(&e[7].1, 7)?;
         if uid > UID_MAX {
             return Err(SchemaError::OutOfRange { key: 7 });
         }
-
-        let target_username = take_text(&e[8].1, 8)?;
-        TextPolicy::check(target_username, 8, 1, MAX_USERNAME, false)?;
-        let pam_service = take_text(&e[9].1, 9)?;
-        TextPolicy::check(pam_service, 9, 1, MAX_PAM_SERVICE, false)?;
-
-        let pam_tty = take_text_or_null(&e[10].1, 10)?;
-        if let Some(s) = pam_tty {
-            TextPolicy::check(s, 10, 1, MAX_PAM_TTY_RHOST, false)?;
-        }
-        let pam_rhost = take_text_or_null(&e[11].1, 11)?;
-        if let Some(s) = pam_rhost {
-            TextPolicy::check(s, 11, 1, MAX_PAM_TTY_RHOST, false)?;
-        }
-
-        let requested_action = take_text(&e[12].1, 12)?;
-        TextPolicy::check(requested_action, 12, 1, MAX_REQUESTED_ACTION, false)?;
-
+        let target_username = take_text(&e[8].1, 8)?.to_owned();
+        let pam_service = take_text(&e[9].1, 9)?.to_owned();
+        let pam_tty = take_text_or_null(&e[10].1, 10)?.map(str::to_owned);
+        let pam_rhost = take_text_or_null(&e[11].1, 11)?.map(str::to_owned);
+        let requested_action = take_text(&e[12].1, 12)?.to_owned();
         let issued_at = take_uint(&e[13].1, 13)?;
         let expires_at = take_uint(&e[14].1, 14)?;
-        if issued_at > EPOCH_MAX || expires_at > EPOCH_MAX {
-            return Err(SchemaError::OutOfRange {
-                key: if issued_at > EPOCH_MAX { 13 } else { 14 },
-            });
-        }
-        if expires_at <= issued_at {
-            return Err(SchemaError::TtlOutOfRange);
-        }
-        let ttl = expires_at - issued_at;
-        if !(TTL_MIN..=TTL_MAX).contains(&ttl) {
-            return Err(SchemaError::TtlOutOfRange);
-        }
+        let confirmation_code = take_text(&e[15].1, 15)?.to_owned();
 
-        let confirmation_code = take_text(&e[15].1, 15)?;
-        // ASCII [0-9]{6} exact。
-        if confirmation_code.len() != 6 || !confirmation_code.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(SchemaError::BadText { key: 15 });
-        }
-
-        Ok(Challenge {
+        let c = Challenge {
             protocol_version,
             request_id,
             nonce,
             verifier_key_id,
             linux_device_id,
-            linux_device_name: linux_device_name.to_owned(),
+            linux_device_name,
             target_uid: uid as u32,
-            target_username: target_username.to_owned(),
-            pam_service: pam_service.to_owned(),
-            pam_tty: pam_tty.map(str::to_owned),
-            pam_rhost: pam_rhost.map(str::to_owned),
-            requested_action: requested_action.to_owned(),
+            target_username,
+            pam_service,
+            pam_tty,
+            pam_rhost,
+            requested_action,
             issued_at,
             expires_at,
-            confirmation_code: confirmation_code.to_owned(),
-        })
+            confirmation_code,
+        };
+        c.validate()?;
+        Ok(c)
     }
 
-    /// canonical バイト列へエンコードする。
-    pub fn encode(&self) -> Vec<u8> {
+    /// 検証してから canonical バイト列へエンコードする。不正な内容は Err（正規化しない）。
+    pub fn encode(&self) -> Result<Vec<u8>, SchemaError> {
+        self.validate()?;
         let entries = vec![
             (0u64, Value::Text(MESSAGE_TYPE_CHALLENGE.to_owned())),
             (1, Value::Uint(self.protocol_version)),
@@ -322,7 +333,7 @@ impl Challenge {
             (14, Value::Uint(self.expires_at)),
             (15, Value::Text(self.confirmation_code.clone())),
         ];
-        cbor::encode(&Value::Map(entries))
+        Ok(cbor::encode(&Value::Map(entries)))
     }
 }
 
@@ -353,29 +364,50 @@ fn envelope_limits() -> Limits {
 }
 
 impl Envelope {
+    /// 層B 制約: canonical_challenge は 1..=CHALLENGE_MAX_TOTAL バイト。
+    /// verifier_signature の長さは型（[u8; 64]）が保証する。
+    pub fn validate(&self) -> Result<(), SchemaError> {
+        let len = self.canonical_challenge.len();
+        if len == 0 || len > CHALLENGE_MAX_TOTAL {
+            return Err(SchemaError::BadLength { key: 0 });
+        }
+        Ok(())
+    }
+
+    /// envelope を復元する。
+    ///
+    /// **重要（プロファイル §6・§8）:** 返る [`Envelope::canonical_challenge`] は**未検証の生バイト列**。
+    /// これは「Ed25519 署名を生バイト列に対して検証する」設計のため意図的にそのまま保持する。
+    /// 呼び出し側は必ず次を行う: (1) `verifier_signature` を登録済み verifier 公開鍵で
+    /// `canonical_challenge` の**生バイト列**に対し検証 → (2) **同じバイト列**を
+    /// [`Challenge::decode`] に通して層A/層B を検査 → (3) 保留中の request 状態（request_id/nonce/
+    /// expiry 等）と照合。**decode しただけの `Envelope` を検証済み Challenge と誤認しないこと。**
     pub fn decode(bytes: &[u8]) -> Result<Envelope, SchemaError> {
         let v = cbor::scan_structure(bytes, envelope_limits())?;
         let e = map_entries(&v, 3)?;
         let canonical_challenge = match &e[0].1 {
-            Value::Bytes(b) if !b.is_empty() && b.len() <= CHALLENGE_MAX_TOTAL => b.clone(),
-            Value::Bytes(_) => return Err(SchemaError::BadLength { key: 0 }),
+            Value::Bytes(b) => b.clone(),
             _ => return Err(SchemaError::WrongType { key: 0 }),
         };
         expect_fixed(&e[1].1, 1, VERIFIER_SIGNATURE_ALGORITHM)?;
         let verifier_signature = take_bytes_exact::<64>(&e[2].1, 2)?;
-        Ok(Envelope {
+        let env = Envelope {
             canonical_challenge,
             verifier_signature,
-        })
+        };
+        env.validate()?;
+        Ok(env)
     }
 
-    pub fn encode(&self) -> Vec<u8> {
+    /// 検証してから canonical バイト列へエンコードする。
+    pub fn encode(&self) -> Result<Vec<u8>, SchemaError> {
+        self.validate()?;
         let entries = vec![
             (0u64, Value::Bytes(self.canonical_challenge.clone())),
             (1, Value::Text(VERIFIER_SIGNATURE_ALGORITHM.to_owned())),
             (2, Value::Bytes(self.verifier_signature.to_vec())),
         ];
-        cbor::encode(&Value::Map(entries))
+        Ok(cbor::encode(&Value::Map(entries)))
     }
 }
 
@@ -405,33 +437,46 @@ fn response_limits() -> Limits {
 }
 
 impl Response {
+    /// 層B 制約: protocol_version==1、signature は 1..=72B（strict DER は crypto 層）。
+    /// exact byte 長フィールドは型が保証する。
+    pub fn validate(&self) -> Result<(), SchemaError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(SchemaError::OutOfRange { key: 1 });
+        }
+        let len = self.signature.len();
+        if len == 0 || len > MAX_DER_SIGNATURE {
+            return Err(SchemaError::BadLength { key: 6 });
+        }
+        Ok(())
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Response, SchemaError> {
         let v = cbor::scan_structure(bytes, response_limits())?;
         let e = map_entries(&v, 7)?;
         expect_fixed(&e[0].1, 0, MESSAGE_TYPE_RESPONSE)?;
         let protocol_version = take_uint(&e[1].1, 1)?;
-        if protocol_version != PROTOCOL_VERSION {
-            return Err(SchemaError::OutOfRange { key: 1 });
-        }
         let request_id = take_bytes_exact::<16>(&e[2].1, 2)?;
         let iphone_device_id = take_bytes_exact::<16>(&e[3].1, 3)?;
         let signed_payload_hash = take_bytes_exact::<32>(&e[4].1, 4)?;
         expect_fixed(&e[5].1, 5, SIGNATURE_ALGORITHM)?;
         let signature = match &e[6].1 {
-            Value::Bytes(b) if !b.is_empty() && b.len() <= MAX_DER_SIGNATURE => b.clone(),
-            Value::Bytes(_) => return Err(SchemaError::BadLength { key: 6 }),
+            Value::Bytes(b) => b.clone(),
             _ => return Err(SchemaError::WrongType { key: 6 }),
         };
-        Ok(Response {
+        let r = Response {
             protocol_version,
             request_id,
             iphone_device_id,
             signed_payload_hash,
             signature,
-        })
+        };
+        r.validate()?;
+        Ok(r)
     }
 
-    pub fn encode(&self) -> Vec<u8> {
+    /// 検証してから canonical バイト列へエンコードする。
+    pub fn encode(&self) -> Result<Vec<u8>, SchemaError> {
+        self.validate()?;
         let entries = vec![
             (0u64, Value::Text(MESSAGE_TYPE_RESPONSE.to_owned())),
             (1, Value::Uint(self.protocol_version)),
@@ -441,7 +486,7 @@ impl Response {
             (5, Value::Text(SIGNATURE_ALGORITHM.to_owned())),
             (6, Value::Bytes(self.signature.clone())),
         ];
-        cbor::encode(&Value::Map(entries))
+        Ok(cbor::encode(&Value::Map(entries)))
     }
 }
 
@@ -472,67 +517,53 @@ mod tests {
     #[test]
     fn challenge_roundtrip() {
         let c = sample_challenge();
-        let bytes = c.encode();
+        let bytes = c.encode().expect("encode ok");
         assert!(bytes.len() <= CHALLENGE_MAX_TOTAL);
         let back = Challenge::decode(&bytes).expect("decode ok");
         assert_eq!(c, back);
     }
 
+    // encode は self を検証するので、不正な struct は encode() 時点で Err（正規化しない）。
     #[test]
-    fn challenge_rejects_bad_uid() {
+    fn challenge_encode_rejects_bad_uid() {
         let mut c = sample_challenge();
         c.target_uid = u32::MAX; // 4294967295 = (uid_t)-1
-        let bytes = c.encode();
-        assert_eq!(
-            Challenge::decode(&bytes),
-            Err(SchemaError::OutOfRange { key: 7 })
-        );
+        assert_eq!(c.encode(), Err(SchemaError::OutOfRange { key: 7 }));
     }
 
     #[test]
-    fn challenge_rejects_bad_ttl() {
+    fn challenge_encode_rejects_bad_ttl() {
         let mut c = sample_challenge();
         c.expires_at = c.issued_at + 31; // TTL 31 > 30
-        assert_eq!(
-            Challenge::decode(&c.encode()),
-            Err(SchemaError::TtlOutOfRange)
-        );
+        assert_eq!(c.encode(), Err(SchemaError::TtlOutOfRange));
         c.expires_at = c.issued_at; // 0
-        assert_eq!(
-            Challenge::decode(&c.encode()),
-            Err(SchemaError::TtlOutOfRange)
-        );
+        assert_eq!(c.encode(), Err(SchemaError::TtlOutOfRange));
     }
 
     #[test]
-    fn challenge_rejects_bad_confirmation_code() {
+    fn challenge_encode_rejects_bad_confirmation_code() {
         let mut c = sample_challenge();
         c.confirmation_code = "12345".into(); // 5 桁
-        assert_eq!(
-            Challenge::decode(&c.encode()),
-            Err(SchemaError::BadText { key: 15 })
-        );
+        assert_eq!(c.encode(), Err(SchemaError::BadText { key: 15 }));
         c.confirmation_code = "12a456".into(); // 非数字
-        assert_eq!(
-            Challenge::decode(&c.encode()),
-            Err(SchemaError::BadText { key: 15 })
-        );
+        assert_eq!(c.encode(), Err(SchemaError::BadText { key: 15 }));
     }
 
     #[test]
-    fn challenge_rejects_control_char() {
+    fn challenge_encode_rejects_control_and_bidi() {
         let mut c = sample_challenge();
         c.linux_device_name = "work\u{0000}station".into(); // NUL
-        assert_eq!(
-            Challenge::decode(&c.encode()),
-            Err(SchemaError::BadText { key: 6 })
-        );
+        assert_eq!(c.encode(), Err(SchemaError::BadText { key: 6 }));
         let mut c2 = sample_challenge();
         c2.target_username = "al\u{202e}ice".into(); // RLO (bidi)
-        assert_eq!(
-            Challenge::decode(&c2.encode()),
-            Err(SchemaError::BadText { key: 8 })
-        );
+        assert_eq!(c2.encode(), Err(SchemaError::BadText { key: 8 }));
+    }
+
+    #[test]
+    fn challenge_encode_rejects_bad_protocol_version() {
+        let mut c = sample_challenge();
+        c.protocol_version = 2;
+        assert_eq!(c.encode(), Err(SchemaError::OutOfRange { key: 1 }));
     }
 
     #[test]
@@ -540,7 +571,7 @@ mod tests {
         let mut c = sample_challenge();
         c.pam_tty = None;
         c.pam_rhost = None;
-        let back = Challenge::decode(&c.encode()).unwrap();
+        let back = Challenge::decode(&c.encode().unwrap()).unwrap();
         assert_eq!(back.pam_tty, None);
         assert_eq!(back.pam_rhost, None);
     }
@@ -578,13 +609,22 @@ mod tests {
 
     #[test]
     fn envelope_roundtrip() {
-        let inner = sample_challenge().encode();
+        let inner = sample_challenge().encode().unwrap();
         let env = Envelope {
             canonical_challenge: inner,
             verifier_signature: [7u8; 64],
         };
-        let back = Envelope::decode(&env.encode()).unwrap();
+        let back = Envelope::decode(&env.encode().unwrap()).unwrap();
         assert_eq!(env, back);
+    }
+
+    #[test]
+    fn envelope_encode_rejects_empty_inner() {
+        let env = Envelope {
+            canonical_challenge: vec![],
+            verifier_signature: [7u8; 64],
+        };
+        assert_eq!(env.encode(), Err(SchemaError::BadLength { key: 0 }));
     }
 
     #[test]
@@ -612,8 +652,20 @@ mod tests {
             signed_payload_hash: [8u8; 32],
             signature: vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01], // 形式は crypto 層で検査
         };
-        let back = Response::decode(&r.encode()).unwrap();
+        let back = Response::decode(&r.encode().unwrap()).unwrap();
         assert_eq!(r, back);
+    }
+
+    #[test]
+    fn response_encode_rejects_empty_signature() {
+        let r = Response {
+            protocol_version: 1,
+            request_id: [1u8; 16],
+            iphone_device_id: [9u8; 16],
+            signed_payload_hash: [8u8; 32],
+            signature: vec![],
+        };
+        assert_eq!(r.encode(), Err(SchemaError::BadLength { key: 6 }));
     }
 
     fn response_entries(sig: Vec<u8>) -> Vec<(u64, Value)> {

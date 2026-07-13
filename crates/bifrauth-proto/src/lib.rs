@@ -9,6 +9,7 @@
 
 pub(crate) mod cbor;
 pub mod schema;
+pub(crate) mod unicode_cn;
 
 pub use cbor::Error as CborError;
 pub use schema::{Challenge, Envelope, Response, SchemaError};

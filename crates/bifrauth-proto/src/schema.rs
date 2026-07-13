@@ -5,12 +5,13 @@
 //! 各スキーマはキー 0..N-1 の連番 map なので、`cbor::scan_structure` が保証する「昇順・一意キー」と合わせ、
 //! 「エントリ数 == N かつ i 番目のキー == i」で余分/欠損/重複/順序違反をまとめて排除する。
 //!
-//! **未実装（依存判断を保留）:** テキストの NFC 正規化検査と「未割当 code point 拒否」は
-//! Unicode 16.0 のデータを要し、Rust/Swift の Unicode バージョン整合という相互運用上の判断が
-//! 必要なため、本コミットでは行わない（[`TextPolicy`] のドキュメント参照）。ASCII・制御・bidi・
-//! byte 長・exact/範囲は実装済み。
+//! テキスト内容は [`TextPolicy`] が検査する: byte 長・ASCII・制御・bidi に加え、**Unicode 16.0
+//! 未割当（Cn, vendored 表）の拒否**と **NFC 正規化検査**（プロファイル §7・§7.1）。Rust/Swift の
+//! 受理集合一致は vendored の Cn 表と共有ベクタで担保する。
 
 use crate::cbor::{self, Limits, Value};
+use crate::unicode_cn;
+use unicode_normalization::UnicodeNormalization;
 
 /// 初版のプロトコルバージョン（プロファイル §10 の対応表）。
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -57,6 +58,10 @@ pub enum SchemaError {
     BadLength { key: u64 },
     /// テキストが ASCII/制御/bidi 制約に違反。
     BadText { key: u64 },
+    /// テキストが NFC 正規化形でない（プロファイル §7）。
+    NotNfc { key: u64 },
+    /// テキストが Unicode 16.0 で未割当（Cn）の code point を含む（プロファイル §7）。
+    Unassigned { key: u64 },
     /// `message_type` が一致しない。
     MessageTypeMismatch,
     /// 固定文字列フィールド（algorithm 等）が一致しない。
@@ -71,15 +76,17 @@ impl From<cbor::Error> for SchemaError {
     }
 }
 
-/// テキストフィールドの内容ポリシー。
+/// テキストフィールドの内容ポリシー（プロファイル §7・§7.1）。
 ///
-/// 実装済み: byte 長範囲、ASCII 限定（指定時）、C0（U+0000..U+001F, NUL 含む）/ C1
-/// （U+0080..U+009F）制御と Bidi_Control code point の拒否。
+/// 検査項目: byte 長範囲、ASCII 限定（指定時）、C0（U+0000..U+001F, NUL 含む）/ C1
+/// （U+0080..U+009F）制御と Bidi_Control code point の拒否、**Unicode 16.0 未割当（Cn）の拒否**、
+/// **NFC 正規化形であることの検査**。
 ///
-/// **未実装（要依存判断）:** NFC 正規化検査と Unicode 16.0 UCD による未割当 code point 拒否。
-/// これらは Unicode データを要し、Rust/Swift 双方が **同一 Unicode バージョン（16.0）** を用いる
-/// ことが相互運用の前提になる。crate 選定（例 `unicode-normalization`）と Unicode バージョン整合を
-/// 決めてから実装する（プロファイル §7）。
+/// NFC/未割当は Rust↔Swift で受理集合を一致させる必要がある（§7.1）:
+/// - 未割当判定は vendored の Unicode 16.0 Cn 表（[`unicode_cn`]）で行い、ライブラリのカテゴリ表に
+///   依存しない。**先に 16.0 未割当を拒否**してから NFC を見る。
+/// - NFC 判定は最新安定版 `unicode-normalization` の NFC 変換をスカラー列比較する（`==` は使わない）。
+///   16.0 割当済みに gate 済みなので、正規化安定性により新しい Unicode 版でも結果は 16.0 と一致する。
 struct TextPolicy;
 
 // Bidi_Control=Yes（Unicode 16.0）: ALM, LRM, RLM, LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI
@@ -97,7 +104,13 @@ impl TextPolicy {
         BIDI_CONTROL.contains(&c)
     }
 
-    /// byte 長 `min..=max`、必要なら ASCII 限定、制御・bidi 拒否を検査する。
+    /// 入力が既に NFC 形かを判定する（`==` は使わず code point 列を直接比較）。
+    /// 呼び出し前に未割当（16.0 Cn）を拒否済みであること（正規化安定性の前提）。
+    fn is_nfc(s: &str) -> bool {
+        s.nfc().eq(s.chars())
+    }
+
+    /// byte 長 `min..=max`、必要なら ASCII 限定、制御・bidi・未割当・非 NFC を検査する。
     fn check(
         s: &str,
         key: u64,
@@ -116,6 +129,13 @@ impl TextPolicy {
             if Self::forbidden_char(ch) {
                 return Err(SchemaError::BadText { key });
             }
+            // 未割当（16.0 Cn）は NFC 判定より先に拒否する（安定性の前提を満たすため）。
+            if unicode_cn::is_cn(ch as u32) {
+                return Err(SchemaError::Unassigned { key });
+            }
+        }
+        if !Self::is_nfc(s) {
+            return Err(SchemaError::NotNfc { key });
         }
         Ok(())
     }
@@ -564,6 +584,31 @@ mod tests {
         let mut c = sample_challenge();
         c.protocol_version = 2;
         assert_eq!(c.encode(), Err(SchemaError::OutOfRange { key: 1 }));
+    }
+
+    #[test]
+    fn challenge_encode_rejects_non_nfc() {
+        // "é" の分解形（e + U+0301 結合アクセント）は非 NFC。
+        let mut c = sample_challenge();
+        c.target_username = "e\u{0301}".into();
+        assert_eq!(c.encode(), Err(SchemaError::NotNfc { key: 8 }));
+    }
+
+    #[test]
+    fn challenge_accepts_nfc_composed() {
+        // 合成形 "é"（U+00E9）は NFC。roundtrip できる。
+        let mut c = sample_challenge();
+        c.target_username = "caf\u{00E9}".into();
+        let back = Challenge::decode(&c.encode().unwrap()).unwrap();
+        assert_eq!(back.target_username, "caf\u{00E9}");
+    }
+
+    #[test]
+    fn challenge_encode_rejects_unassigned() {
+        // U+0378 は Unicode 16.0 で未割当（Cn）。
+        let mut c = sample_challenge();
+        c.linux_device_name = "ws\u{0378}".into();
+        assert_eq!(c.encode(), Err(SchemaError::Unassigned { key: 6 }));
     }
 
     #[test]

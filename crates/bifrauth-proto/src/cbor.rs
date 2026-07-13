@@ -14,6 +14,16 @@
 //!
 //! テキストの NFC / 未割当 / 制御・bidi などの**内容**制約は層B（テキストポリシー）で扱う
 //! （Unicode データを要するため別モジュール）。ここは構造 canonicality に限定する。
+//!
+//! **本モジュールは `pub(crate)`（内部）。** [`scan_structure`] の `Ok` は「構造 canonical かつ
+//! UTF-8 妥当」までを意味し、**認証入力として妥当ではない**（NFC/テキストポリシー + 層B スキーマが
+//! 別途必要）。外部公開は `crate::schema` の検証済みデコーダ/エンコーダのみ。
+//!
+//! **禁止 major の分類:** major 1（negative）/ 4（array）/ 6（tag）は初期バイトを読んだ時点で
+//! 即 [`Error::ForbiddenMajor`] を返す（ai/body を読まない）。よって例えば `0x9f`（indefinite array）や
+//! `0xd8`（tag head）は `IndefiniteLength`/`Truncated` ではなく `ForbiddenMajor` になる。いずれも
+//! fail closed で受理集合は同一。詳細な下位分類（indefinite/reserved/truncated）は**許可 major に
+//! 対してのみ**保証する（プロファイル §2 の well-formedness→型拒否順の実装上の確定）。
 
 /// 層A のリソース境界（プロファイル §3）。スキーマ層が実値を渡す。
 #[derive(Clone, Copy, Debug)]
@@ -123,10 +133,16 @@ fn encode_value(out: &mut Vec<u8>, v: &Value) {
         }
         Value::Null => out.push(0xf6),
         Value::Map(entries) => {
-            encode_head(out, 5, entries.len() as u64);
             // canonical: キー昇順で出力する（呼び出し側の順序に依存しない）。
+            // 内部契約: キーは一意。schema エンコーダが 0..N-1 を構築するので満たされる。
+            // duplicate を黙って落とさず、debug ビルドで検出する（非 canonical 出力の防止）。
+            encode_head(out, 5, entries.len() as u64);
             let mut idx: Vec<usize> = (0..entries.len()).collect();
             idx.sort_by_key(|&i| entries[i].0);
+            debug_assert!(
+                idx.windows(2).all(|w| entries[w[0]].0 < entries[w[1]].0),
+                "encode: map keys must be unique and this crate must only encode schema-built maps",
+            );
             for &i in &idx {
                 encode_head(out, 0, entries[i].0);
                 encode_value(out, &entries[i].1);
@@ -270,9 +286,10 @@ impl<'a> Scanner<'a> {
             let key = self.read_arg(kb & 0x1f)?;
             // strict 昇順 = 順序違反と重複を同時に検出。
             if let Some(p) = prev
-                && key <= p {
-                    return Err(Error::UnorderedOrDuplicateKey);
-                }
+                && key <= p
+            {
+                return Err(Error::UnorderedOrDuplicateKey);
+            }
             prev = Some(key);
             let val = self.read_value(depth + 1)?;
             entries.push((key, val));
@@ -302,9 +319,12 @@ impl<'a> Scanner<'a> {
     }
 }
 
-/// 受信バイト列を層A の規則で走査し、canonical であれば `Value` を返す。
+/// 受信バイト列を**層Aの構造規則**で走査し、構造 canonical なら `Value` を返す（内部 API）。
+///
+/// これは構造 canonicality と UTF-8 妥当性までで、**テキストの NFC/未割当や層B スキーマは含まない**。
+/// したがって `Ok` は「認証入力として妥当」を意味しない — 上位の `schema` デコーダ経由でのみ用いる。
 /// trailing bytes（複数 top-level を含む）は拒否する。
-pub fn scan(buf: &[u8], limits: Limits) -> Result<Value, Error> {
+pub fn scan_structure(buf: &[u8], limits: Limits) -> Result<Value, Error> {
     if buf.len() > limits.max_total {
         return Err(Error::TooLarge);
     }
@@ -352,7 +372,7 @@ mod tests {
             Value::Null,
         ] {
             let enc = encode(&v);
-            let dec = scan(&enc, limits()).expect("scan ok");
+            let dec = scan_structure(&enc, limits()).expect("scan ok");
             assert_eq!(v, dec, "roundtrip {v:?}");
         }
     }
@@ -366,7 +386,7 @@ mod tests {
             (7, Value::Null),
         ]);
         let enc = encode(&v);
-        let dec = scan(&enc, limits()).unwrap();
+        let dec = scan_structure(&enc, limits()).unwrap();
         assert_eq!(
             dec,
             map(vec![
@@ -381,56 +401,89 @@ mod tests {
     fn reject_non_shortest_uint() {
         // 24 を 2 バイト（0x18 0x18 が最短）ではなく非最短の 0x19 0x00 0x18 で表す。
         assert_eq!(
-            scan(&[0x19, 0x00, 0x18], limits()),
+            scan_structure(&[0x19, 0x00, 0x18], limits()),
             Err(Error::NonShortestInt)
         );
         // 0 を 0x18 0x00（非最短、0x00 が最短）
-        assert_eq!(scan(&[0x18, 0x00], limits()), Err(Error::NonShortestInt));
+        assert_eq!(
+            scan_structure(&[0x18, 0x00], limits()),
+            Err(Error::NonShortestInt)
+        );
     }
 
     #[test]
     fn reject_indefinite_and_break() {
         // indefinite byte string (0x5f)
-        assert_eq!(scan(&[0x5f, 0xff], limits()), Err(Error::IndefiniteLength));
+        assert_eq!(
+            scan_structure(&[0x5f, 0xff], limits()),
+            Err(Error::IndefiniteLength)
+        );
         // 単独 break
-        assert_eq!(scan(&[0xff], limits()), Err(Error::UnexpectedBreak));
+        assert_eq!(
+            scan_structure(&[0xff], limits()),
+            Err(Error::UnexpectedBreak)
+        );
     }
 
     #[test]
     fn reject_reserved_ai() {
-        assert_eq!(scan(&[0x1c], limits()), Err(Error::ReservedAdditionalInfo)); // major0 ai28
+        assert_eq!(
+            scan_structure(&[0x1c], limits()),
+            Err(Error::ReservedAdditionalInfo)
+        ); // major0 ai28
     }
 
     #[test]
     fn reject_forbidden_majors() {
-        assert_eq!(scan(&[0x20], limits()), Err(Error::ForbiddenMajor(1))); // -1
-        assert_eq!(scan(&[0x80], limits()), Err(Error::ForbiddenMajor(4))); // array(0)
-        assert_eq!(scan(&[0xc0], limits()), Err(Error::ForbiddenMajor(6))); // tag
+        assert_eq!(
+            scan_structure(&[0x20], limits()),
+            Err(Error::ForbiddenMajor(1))
+        ); // -1
+        assert_eq!(
+            scan_structure(&[0x80], limits()),
+            Err(Error::ForbiddenMajor(4))
+        ); // array(0)
+        assert_eq!(
+            scan_structure(&[0xc0], limits()),
+            Err(Error::ForbiddenMajor(6))
+        ); // tag
     }
 
     #[test]
     fn reject_bool_undefined_float() {
-        assert_eq!(scan(&[0xf4], limits()), Err(Error::ForbiddenSimpleOrFloat)); // false
-        assert_eq!(scan(&[0xf5], limits()), Err(Error::ForbiddenSimpleOrFloat)); // true
-        assert_eq!(scan(&[0xf7], limits()), Err(Error::ForbiddenSimpleOrFloat)); // undefined
         assert_eq!(
-            scan(&[0xfa, 0, 0, 0, 0], limits()),
+            scan_structure(&[0xf4], limits()),
+            Err(Error::ForbiddenSimpleOrFloat)
+        ); // false
+        assert_eq!(
+            scan_structure(&[0xf5], limits()),
+            Err(Error::ForbiddenSimpleOrFloat)
+        ); // true
+        assert_eq!(
+            scan_structure(&[0xf7], limits()),
+            Err(Error::ForbiddenSimpleOrFloat)
+        ); // undefined
+        assert_eq!(
+            scan_structure(&[0xfa, 0, 0, 0, 0], limits()),
             Err(Error::ForbiddenSimpleOrFloat)
         ); // f32
     }
 
     #[test]
     fn null_accepted() {
-        assert_eq!(scan(&[0xf6], limits()), Ok(Value::Null));
+        assert_eq!(scan_structure(&[0xf6], limits()), Ok(Value::Null));
     }
 
     #[test]
     fn simple_f8_distinguishes_reasons() {
         // 0xf8 0x00 : simple 0 を 1 バイト形式で（非最短）
-        assert_eq!(scan(&[0xf8, 0x00], limits()), Err(Error::NonShortestSimple));
+        assert_eq!(
+            scan_structure(&[0xf8, 0x00], limits()),
+            Err(Error::NonShortestSimple)
+        );
         // 0xf8 0xff : simple 255（allowlist 外）
         assert_eq!(
-            scan(&[0xf8, 0xff], limits()),
+            scan_structure(&[0xf8, 0xff], limits()),
             Err(Error::OutOfAllowlistSimple)
         );
     }
@@ -439,19 +492,19 @@ mod tests {
     fn reject_trailing_bytes() {
         let mut enc = encode(&Value::Uint(1));
         enc.push(0x01); // 余剰 top-level
-        assert_eq!(scan(&enc, limits()), Err(Error::TrailingBytes));
+        assert_eq!(scan_structure(&enc, limits()), Err(Error::TrailingBytes));
     }
 
     #[test]
     fn reject_unordered_and_duplicate_keys() {
         // {1:0, 0:0} 昇順違反
         assert_eq!(
-            scan(&[0xa2, 0x01, 0x00, 0x00, 0x00], limits()),
+            scan_structure(&[0xa2, 0x01, 0x00, 0x00, 0x00], limits()),
             Err(Error::UnorderedOrDuplicateKey)
         );
         // {0:0, 0:0} 重複
         assert_eq!(
-            scan(&[0xa2, 0x00, 0x00, 0x00, 0x00], limits()),
+            scan_structure(&[0xa2, 0x00, 0x00, 0x00, 0x00], limits()),
             Err(Error::UnorderedOrDuplicateKey)
         );
     }
@@ -460,7 +513,7 @@ mod tests {
     fn reject_non_uint_map_key() {
         // {"a":0} テキストキー
         assert_eq!(
-            scan(&[0xa1, 0x61, b'a', 0x00], limits()),
+            scan_structure(&[0xa1, 0x61, b'a', 0x00], limits()),
             Err(Error::NonUintMapKey)
         );
     }
@@ -469,7 +522,7 @@ mod tests {
     fn reject_depth_exceeded() {
         // max_depth=1 で map の値が map（depth2）: {0:{}}
         assert_eq!(
-            scan(&[0xa1, 0x00, 0xa0], limits()),
+            scan_structure(&[0xa1, 0x00, 0xa0], limits()),
             Err(Error::DepthExceeded)
         );
     }
@@ -481,19 +534,28 @@ mod tests {
             ..limits()
         };
         // bstr 長 5（0x45 = major2, len5）だが上限4
-        assert_eq!(scan(&[0x45, 1, 2, 3, 4, 5], l), Err(Error::TooLarge));
+        assert_eq!(
+            scan_structure(&[0x45, 1, 2, 3, 4, 5], l),
+            Err(Error::TooLarge)
+        );
     }
 
     #[test]
     fn reject_declared_len_beyond_input() {
         // bstr 長 10 だが本体が足りない → 確保前に Truncated
-        assert_eq!(scan(&[0x4a, 1, 2, 3], limits()), Err(Error::Truncated));
+        assert_eq!(
+            scan_structure(&[0x4a, 1, 2, 3], limits()),
+            Err(Error::Truncated)
+        );
     }
 
     #[test]
     fn reject_invalid_utf8() {
         // tstr 長1、本体 0xff は不正 UTF-8
-        assert_eq!(scan(&[0x61, 0xff], limits()), Err(Error::InvalidUtf8));
+        assert_eq!(
+            scan_structure(&[0x61, 0xff], limits()),
+            Err(Error::InvalidUtf8)
+        );
     }
 
     #[test]
@@ -502,6 +564,301 @@ mod tests {
             max_total: 1,
             ..limits()
         };
-        assert_eq!(scan(&[0x00, 0x00], l), Err(Error::TooLarge));
+        assert_eq!(scan_structure(&[0x00, 0x00], l), Err(Error::TooLarge));
+    }
+
+    #[test]
+    fn accepts_total_at_exact_boundary() {
+        let l = Limits {
+            max_total: 1,
+            ..limits()
+        };
+        assert_eq!(scan_structure(&[0x00], l), Ok(Value::Uint(0)));
+    }
+
+    #[test]
+    fn empty_input_is_truncated() {
+        assert_eq!(scan_structure(&[], limits()), Err(Error::Truncated));
+    }
+}
+
+/// 追加テスト（codex 中間レビュー 第1巡 指摘4〜8）: バイト厳密 table、非最短各 ai、
+/// 長さ head 境界、truncated、simple/forbidden 全分類、map 境界、fuzz smoke / roundtrip。
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    fn limits() -> Limits {
+        Limits::default()
+    }
+
+    #[test]
+    fn uint_encoding_is_byte_exact() {
+        // (値, 期待バイト列)。RFC 8949 preferred serialization。
+        let cases: &[(u64, &[u8])] = &[
+            (23, &[0x17]),
+            (24, &[0x18, 0x18]),
+            (255, &[0x18, 0xff]),
+            (256, &[0x19, 0x01, 0x00]),
+            (65_535, &[0x19, 0xff, 0xff]),
+            (65_536, &[0x1a, 0x00, 0x01, 0x00, 0x00]),
+            (u32::MAX as u64, &[0x1a, 0xff, 0xff, 0xff, 0xff]),
+            (
+                u32::MAX as u64 + 1,
+                &[0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+            ),
+            (
+                u64::MAX,
+                &[0x1b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            ),
+        ];
+        for (val, bytes) in cases {
+            assert_eq!(&encode(&Value::Uint(*val)), bytes, "encode {val}");
+            assert_eq!(
+                scan_structure(bytes, limits()),
+                Ok(Value::Uint(*val)),
+                "scan {val}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_shortest_per_ai_rejected() {
+        // 各 ai で 1 段小さい表現に収まる値 → NonShortestInt。
+        assert_eq!(
+            scan_structure(&[0x18, 0x17], limits()),
+            Err(Error::NonShortestInt)
+        ); // 23 in ai24
+        assert_eq!(
+            scan_structure(&[0x19, 0x00, 0xff], limits()),
+            Err(Error::NonShortestInt)
+        ); // 255 in ai25
+        assert_eq!(
+            scan_structure(&[0x1a, 0x00, 0x00, 0xff, 0xff], limits()),
+            Err(Error::NonShortestInt)
+        ); // 65535 in ai26
+        assert_eq!(
+            scan_structure(
+                &[0x1b, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff],
+                limits()
+            ),
+            Err(Error::NonShortestInt)
+        ); // u32::MAX in ai27
+    }
+
+    #[test]
+    fn length_head_boundaries_for_bstr() {
+        // 24 バイトの bstr は 0x58 0x18 が最短。0x58 0x17（長さ23の1バイト形式）は非最短。
+        let mut ok = vec![0x58, 0x18];
+        ok.extend_from_slice(&[0u8; 24]);
+        assert_eq!(
+            scan_structure(&ok, limits()),
+            Ok(Value::Bytes(vec![0u8; 24]))
+        );
+        assert_eq!(
+            scan_structure(&[0x58, 0x17], limits()),
+            Err(Error::NonShortestInt)
+        );
+    }
+
+    #[test]
+    fn truncated_heads() {
+        assert_eq!(scan_structure(&[0x18], limits()), Err(Error::Truncated)); // ai24 head
+        assert_eq!(
+            scan_structure(&[0x19, 0x01], limits()),
+            Err(Error::Truncated)
+        ); // ai25
+        assert_eq!(
+            scan_structure(&[0x1a, 0x00, 0x01], limits()),
+            Err(Error::Truncated)
+        ); // ai26
+        assert_eq!(
+            scan_structure(&[0x1b, 0x00], limits()),
+            Err(Error::Truncated)
+        ); // ai27
+    }
+
+    #[test]
+    fn huge_declared_lengths_rejected_before_alloc() {
+        // ai27 = u64::MAX を bstr 長として → 上限超過（TooLarge）。確保しない。
+        assert_eq!(
+            scan_structure(
+                &[0x5b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                limits()
+            ),
+            Err(Error::TooLarge)
+        );
+        // map count = u64::MAX → 上限超過。
+        assert_eq!(
+            scan_structure(
+                &[0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                limits()
+            ),
+            Err(Error::TooLarge)
+        );
+    }
+
+    #[test]
+    fn all_forbidden_simple_and_float() {
+        assert_eq!(
+            scan_structure(&[0xe0], limits()),
+            Err(Error::ForbiddenSimpleOrFloat)
+        ); // simple 0
+        assert_eq!(
+            scan_structure(&[0xf3], limits()),
+            Err(Error::ForbiddenSimpleOrFloat)
+        ); // simple 19
+        assert_eq!(
+            scan_structure(&[0xf8, 0x17], limits()),
+            Err(Error::NonShortestSimple)
+        ); // f8 23
+        assert_eq!(
+            scan_structure(&[0xf8, 0x18], limits()),
+            Err(Error::OutOfAllowlistSimple)
+        ); // f8 24
+        assert_eq!(
+            scan_structure(&[0xf9, 0x00, 0x00], limits()),
+            Err(Error::ForbiddenSimpleOrFloat)
+        ); // f16
+        assert_eq!(
+            scan_structure(&[0xfb, 0, 0, 0, 0, 0, 0, 0, 0], limits()),
+            Err(Error::ForbiddenSimpleOrFloat)
+        ); // f64
+    }
+
+    #[test]
+    fn reserved_ai_across_majors() {
+        assert_eq!(
+            scan_structure(&[0x1c], limits()),
+            Err(Error::ReservedAdditionalInfo)
+        ); // major0 ai28
+        assert_eq!(
+            scan_structure(&[0x5d], limits()),
+            Err(Error::ReservedAdditionalInfo)
+        ); // major2 ai29
+        assert_eq!(
+            scan_structure(&[0xbe], limits()),
+            Err(Error::ReservedAdditionalInfo)
+        ); // major5 ai30
+    }
+
+    #[test]
+    fn indefinite_across_majors_and_array_precedence() {
+        assert_eq!(
+            scan_structure(&[0x1f], limits()),
+            Err(Error::IndefiniteLength)
+        ); // major0 ai31
+        assert_eq!(
+            scan_structure(&[0x5f], limits()),
+            Err(Error::IndefiniteLength)
+        ); // bstr*
+        assert_eq!(
+            scan_structure(&[0x7f], limits()),
+            Err(Error::IndefiniteLength)
+        ); // tstr*
+        assert_eq!(
+            scan_structure(&[0xbf], limits()),
+            Err(Error::IndefiniteLength)
+        ); // map*
+        // 0x9f は major4(array)。array は初期バイトで即拒否（indefinite より先）。
+        assert_eq!(
+            scan_structure(&[0x9f], limits()),
+            Err(Error::ForbiddenMajor(4))
+        );
+        // 0xd8 は major6(tag) head。tag は即拒否（truncated より先）。
+        assert_eq!(
+            scan_structure(&[0xd8], limits()),
+            Err(Error::ForbiddenMajor(6))
+        );
+    }
+
+    #[test]
+    fn break_inside_map_value() {
+        // {0: <break>} → 値位置の 0xff。
+        assert_eq!(
+            scan_structure(&[0xa1, 0x00, 0xff], limits()),
+            Err(Error::UnexpectedBreak)
+        );
+    }
+
+    #[test]
+    fn empty_map_ok() {
+        assert_eq!(scan_structure(&[0xa0], limits()), Ok(Value::Map(vec![])));
+    }
+
+    #[test]
+    fn map_key_non_shortest_rejected() {
+        // {24-form(0): 0} キー head が非最短。
+        assert_eq!(
+            scan_structure(&[0xa1, 0x18, 0x00, 0x00], limits()),
+            Err(Error::NonShortestInt)
+        );
+    }
+
+    #[test]
+    fn map_key_order_boundary_23_24() {
+        // {23:0, 24:0} 昇順 OK。
+        let ok = [0xa2, 0x17, 0x00, 0x18, 0x18, 0x00];
+        assert_eq!(
+            scan_structure(&ok, limits()),
+            Ok(Value::Map(vec![(23, Value::Uint(0)), (24, Value::Uint(0))]))
+        );
+        // {24:0, 23:0} 逆順 → 拒否。
+        let bad = [0xa2, 0x18, 0x18, 0x00, 0x17, 0x00];
+        assert_eq!(
+            scan_structure(&bad, limits()),
+            Err(Error::UnorderedOrDuplicateKey)
+        );
+    }
+
+    #[test]
+    fn map_entries_limit_boundary() {
+        let l = Limits {
+            max_map_entries: 2,
+            ..limits()
+        };
+        // 2 エントリ OK。
+        assert!(scan_structure(&[0xa2, 0x00, 0x00, 0x01, 0x00], l).is_ok());
+        // 3 エントリ → TooLarge。
+        assert_eq!(
+            scan_structure(&[0xa3, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00], l),
+            Err(Error::TooLarge)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "map keys must be unique")]
+    fn encode_duplicate_key_panics_in_debug() {
+        // 内部契約違反（重複キー）は debug ビルドで検出する（黙って dedup しない）。
+        let v = Value::Map(vec![(0, Value::Uint(1)), (0, Value::Uint(2))]);
+        let _ = encode(&v);
+    }
+
+    #[test]
+    fn fuzz_smoke_all_single_bytes_no_panic() {
+        for b in 0u16..=255 {
+            let _ = scan_structure(&[b as u8], limits());
+        }
+    }
+
+    #[test]
+    fn ok_implies_canonical_reencode_roundtrip() {
+        // 1〜3 バイトを総当りし、Ok なら encode(decoded) が入力と一致することを確認。
+        // 構造 canonical の不動点性（scan は非 canonical を Ok にしない）を担保する。
+        let mut buf = Vec::new();
+        for a in 0u16..=255 {
+            buf.clear();
+            buf.push(a as u8);
+            if let Ok(v) = scan_structure(&buf, limits()) {
+                assert_eq!(encode(&v), buf, "1-byte {a:#x}");
+            }
+            for b in 0u16..=255 {
+                buf.clear();
+                buf.extend_from_slice(&[a as u8, b as u8]);
+                if let Ok(v) = scan_structure(&buf, limits()) {
+                    assert_eq!(encode(&v), buf, "2-byte {a:#x} {b:#x}");
+                }
+            }
+        }
     }
 }

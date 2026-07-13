@@ -1,14 +1,7 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! bifrauth-proto — BifrAuth のメッセージ表現と canonical CBOR。
+//!
+//! 規範は `spec/cbor-profile.md`（codex クロスレビュー承認済み）。
+//! - [`cbor`]: 層A（deterministic profile validity）の canonical エンコーダと直接スキャナ。
+//! - スキーマ層（層B: challenge.v1 / response.v1 / envelope.v1）は今後追加する。
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod cbor;

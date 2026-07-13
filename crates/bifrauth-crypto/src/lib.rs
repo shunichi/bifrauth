@@ -291,6 +291,46 @@ mod tests {
     }
 
     #[test]
+    fn p256_rejects_r_or_s_equal_to_order() {
+        use p256::ecdsa::SigningKey;
+        // 上限 r,s ∈ [1, n-1] の保証（n 境界）を固定する。
+        let sk = SigningKey::from_slice(&[0x11u8; 32]).unwrap();
+        let sec1 = sk.verifying_key().to_sec1_bytes();
+        let msg = b"m";
+        // P-256 の位数 n。
+        const N: [u8; 32] = [
+            0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2,
+            0xFC, 0x63, 0x25, 0x51,
+        ];
+        // INTEGER n: 高位ビットが立つので leading 0x00 を付けた 33B（0x02 0x21 0x00 || N）。
+        let int_n = {
+            let mut v = vec![0x02u8, 0x21, 0x00];
+            v.extend_from_slice(&N);
+            v
+        };
+        let int_one = [0x02u8, 0x01, 0x01];
+        let seq = |a: &[u8], b: &[u8]| {
+            let mut body = a.to_vec();
+            body.extend_from_slice(b);
+            let mut out = vec![0x30u8, body.len() as u8];
+            out.extend_from_slice(&body);
+            out
+        };
+        // r=n, s=1 / r=1, s=n はいずれも範囲外 → BadSignature。
+        assert_eq!(
+            p256_ecdsa::verify(&sec1, msg, &seq(&int_n, &int_one)),
+            Err(Error::BadSignature),
+            "r=n"
+        );
+        assert_eq!(
+            p256_ecdsa::verify(&sec1, msg, &seq(&int_one, &int_n)),
+            Err(Error::BadSignature),
+            "s=n"
+        );
+    }
+
+    #[test]
     fn csprng_confirmation_code_shape() {
         // 形状のみ（一様性の証明は csprng::tests の決定論境界テストで担保）。
         for _ in 0..100 {

@@ -830,7 +830,7 @@ mod boundary_tests {
 
     #[test]
     #[should_panic(expected = "map keys must be unique")]
-    fn encode_duplicate_key_panics_in_debug() {
+    fn encode_duplicate_key_panics_in_all_profiles() {
         // 内部契約違反（重複キー）は debug ビルドで検出する（黙って dedup しない）。
         let v = Value::Map(vec![(0, Value::Uint(1)), (0, Value::Uint(2))]);
         let _ = encode(&v);

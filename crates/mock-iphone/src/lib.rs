@@ -1,13 +1,21 @@
-//! mock-iphone — iPhone（Secure Enclave / Face ID）の**ソフトウェア模擬**。
+//! mock-iphone — iPhone（Secure Enclave / Face ID）の**部分的ソフトウェア模擬（crypto skeleton）**。
 //!
-//! Linux 側の「challenge 生成 → verifier 署名 → 応答署名 → 検証」を、**実 iPhone なしで
-//! このマシンだけ**で通すためのテスト用ダブル（設計 §9.5、実装計画の mock-iphone フェーズ）。
+//! Linux 側の「challenge 生成 → verifier 署名 → 応答署名 → 検証」の**署名往復の骨格**を、
+//! **実 iPhone なしでこのマシンだけ**で通すためのテスト用ダブル。設計 §9.5 の**一部のみ**を実装する。
 //!
-//! **実機との違い（重要）:**
-//! - 秘密鍵は**ソフトウェアの P-256 鍵**で、Secure Enclave は使わない。
-//! - **Face ID は常に成功**とみなす。number matching（6桁確認コードの入力照合）・確認コードの
-//!   非表示不変条件・pairing/allowlist は**未実装**（後続フェーズ/別タスク）。
-//! - よってこれは署名往復の骨格を検証するための **mock** であり、iPhone の本人性保証は模さない。
+//! **実装済み（設計 §9.5 のうち）:**
+//! - envelope の Ed25519 verifier 署名検証（canonical_challenge の生バイト列に対して）。
+//! - 内包 challenge の層A/層B 検査（`Challenge::decode`）。
+//! - `verifier_key_id` の照合（設計 §8.2: 登録 Ed25519 公開鍵の SHA-256 と一致するか）。
+//! - `linux_device_id` の照合。
+//! - canonical_challenge への P-256 署名（Face ID は**常に成功**とみなす mock）。
+//!
+//! **未実装（誤認しないこと。後続フェーズ/別タスクへ deferred）:**
+//! - 期限（issued/expires・CLOCK_BOOTTIME）検査、request_id の replay 防止。
+//! - 用途 allowlist、number matching（6桁確認コードの入力照合）と確認コード非表示不変条件。
+//! - Face ID の失敗/キャンセル注入（P5 状態機械）。pairing/登録、Secure Enclave 実体。
+//!
+//! すなわち本 crate は **iPhone の本人性保証を模さない**。実機（Swift）置換時に上記 gate を足す。
 
 use bifrauth_proto::{Challenge, Envelope, Response, SchemaError};
 use p256::ecdsa::signature::Signer;
@@ -22,6 +30,8 @@ pub enum Error {
     VerifierSignatureInvalid,
     /// 内包 challenge の層A/層B 検査に失敗。
     ChallengeInvalid(SchemaError),
+    /// challenge の verifier_key_id が登録 verifier 鍵の SHA-256 と一致しない（設計 §8.2）。
+    UnknownVerifierKeyId,
     /// challenge の linux_device_id が登録済み verifier と一致しない。
     UnknownLinuxDevice,
     /// 応答の構築に失敗（想定外。DER 長など）。
@@ -83,7 +93,11 @@ impl MockIphone {
         let challenge =
             Challenge::decode(&env.canonical_challenge).map_err(Error::ChallengeInvalid)?;
 
-        // (4) 登録済み Linux 端末か。
+        // (4a) verifier_key_id が登録 verifier 鍵の SHA-256 と一致するか（設計 §8.2）。
+        if challenge.verifier_key_id != bifrauth_crypto::sha256(&self.verifier_ed25519_pk) {
+            return Err(Error::UnknownVerifierKeyId);
+        }
+        // (4b) 登録済み Linux 端末か。
         if challenge.linux_device_id != self.linux_device_id {
             return Err(Error::UnknownLinuxDevice);
         }
@@ -133,6 +147,13 @@ mod tests {
         }
     }
 
+    /// verifier 公開鍵に対応する正しい verifier_key_id（SHA-256）を設定した challenge。
+    fn challenge_for(vpk: &[u8; 32]) -> Challenge {
+        let mut c = sample_challenge();
+        c.verifier_key_id = sha256(vpk);
+        c
+    }
+
     /// verifier が envelope を作る（seed から Ed25519 鍵を作り canonical を署名して包む）。
     fn build_envelope(verifier_seed: &[u8; 32], canonical: &[u8]) -> Vec<u8> {
         let sk = ed25519::signing_key(verifier_seed);
@@ -152,7 +173,7 @@ mod tests {
         let iphone = MockIphone::new(IPHONE_DEV, &[0x55; 32], vpk, LINUX_DEV).unwrap();
 
         // verifier: challenge を作り canonical にして envelope 化。
-        let canonical = sample_challenge().encode().unwrap();
+        let canonical = challenge_for(&vpk).encode().unwrap();
         let envelope = build_envelope(&[0x03; 32], &canonical);
 
         // mock-iphone: 処理して response を返す。
@@ -170,16 +191,64 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tampered_envelope() {
+    fn rejects_tampered_canonical_with_stale_signature() {
+        // raw バイト列への署名境界を厳密に証明する:
+        // canonical を verifier 署名 → canonical の1バイトだけ改ざん → 古い署名のまま
+        // envelope を再構築 → 必ず VerifierSignatureInvalid（decode は通る）。
         let vpk = ed25519::public_key(&ed25519::signing_key(&[0x03; 32]));
         let iphone = MockIphone::new(IPHONE_DEV, &[0x55; 32], vpk, LINUX_DEV).unwrap();
+
+        let canonical = challenge_for(&vpk).encode().unwrap();
+        let sig = ed25519::sign(&ed25519::signing_key(&[0x03; 32]), &canonical);
+
+        let mut tampered = canonical.clone();
+        tampered[10] ^= 0x01; // canonical_challenge を1バイト改ざん
+        // 署名検証(step 2)は Challenge::decode(step 3) より前なので、改ざん canonical が
+        // CBOR として妥当か否かに関わらず、古い署名との不一致で先に弾かれる。
+        let envelope = Envelope {
+            canonical_challenge: tampered,
+            verifier_signature: sig,
+        }
+        .encode()
+        .unwrap();
+
+        assert_eq!(
+            iphone.process(&envelope),
+            Err(Error::VerifierSignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_verifier_key_id() {
+        // 署名は正当だが verifier_key_id が登録鍵の SHA-256 と不一致 → UnknownVerifierKeyId。
+        let vpk = ed25519::public_key(&ed25519::signing_key(&[0x03; 32]));
+        let iphone = MockIphone::new(IPHONE_DEV, &[0x55; 32], vpk, LINUX_DEV).unwrap();
+        // sample_challenge の verifier_key_id は [0x33; 32] で sha256(vpk) と一致しない。
         let canonical = sample_challenge().encode().unwrap();
-        let mut envelope = build_envelope(&[0x03; 32], &canonical);
-        // canonical_challenge の 1 バイトを改ざん（envelope 内、bstr 本体の位置）。
-        let n = envelope.len();
-        envelope[n / 2] ^= 0x01;
-        // envelope の decode に通っても署名不一致で拒否される（または decode 失敗）。
-        assert!(iphone.process(&envelope).is_err());
+        let envelope = build_envelope(&[0x03; 32], &canonical);
+        assert_eq!(iphone.process(&envelope), Err(Error::UnknownVerifierKeyId));
+    }
+
+    #[test]
+    fn signed_payload_hash_is_not_trusted() {
+        // 応答の signed_payload_hash を改ざんしても P-256 署名は canonical に対して有効なまま。
+        // verifier は保留 canonical から再計算した hash と比較して不一致を検出する（信用しない）。
+        let vpk = ed25519::public_key(&ed25519::signing_key(&[0x03; 32]));
+        let iphone = MockIphone::new(IPHONE_DEV, &[0x55; 32], vpk, LINUX_DEV).unwrap();
+        let canonical = challenge_for(&vpk).encode().unwrap();
+        let envelope = build_envelope(&[0x03; 32], &canonical);
+        let resp_bytes = iphone.process(&envelope).unwrap();
+
+        let mut resp = Response::decode(&resp_bytes).unwrap();
+        resp.signed_payload_hash[0] ^= 0x01; // hash を改ざん
+        let tampered = resp.encode().unwrap();
+        let resp2 = Response::decode(&tampered).unwrap();
+
+        let iphone_pk = iphone.device_public_key_sec1();
+        // 署名は依然 canonical に対して有効（署名対象は hash ではなく canonical bytes）。
+        assert!(p256_ecdsa::verify(&iphone_pk, &canonical, &resp2.signature).is_ok());
+        // だが verifier が再計算する hash とは一致しない → 認証入力として信用してはならない。
+        assert_ne!(resp2.signed_payload_hash, sha256(&canonical));
     }
 
     #[test]
@@ -198,11 +267,51 @@ mod tests {
     #[test]
     fn rejects_unknown_linux_device() {
         let vpk = ed25519::public_key(&ed25519::signing_key(&[0x03; 32]));
-        // mock は別の linux_device_id を登録している。
+        // mock は別の linux_device_id を登録している（verifier_key_id は一致させ 4b に到達させる）。
         let iphone = MockIphone::new(IPHONE_DEV, &[0x55; 32], vpk, [0x99; 16]).unwrap();
-        let canonical = sample_challenge().encode().unwrap(); // linux_device_id = 0x44*16
+        let canonical = challenge_for(&vpk).encode().unwrap(); // linux_device_id = 0x44*16
         let envelope = build_envelope(&[0x03; 32], &canonical);
         assert_eq!(iphone.process(&envelope), Err(Error::UnknownLinuxDevice));
+    }
+
+    #[test]
+    fn shared_crypto_vectors_conformance() {
+        // spec/vectors/crypto_vectors.tsv を読み、SHA-256/Ed25519/P-256 の契約を検証する。
+        const TSV: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../spec/vectors/crypto_vectors.tsv"
+        ));
+        let mut m = std::collections::HashMap::new();
+        for line in TSV.lines() {
+            let line = line.trim_end();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (k, v) = line.split_once('\t').unwrap();
+            m.insert(k, from_hex(v));
+        }
+        let canonical = &m["canonical"];
+        // SHA-256 は exact 一致。
+        assert_eq!(&sha256(canonical).to_vec(), &m["sha256"]);
+        // Ed25519: 公開鍵で canonical への署名が verify できる（exact 署名だが契約は検証成功）。
+        let pk: [u8; 32] = m["ed25519_pubkey"].as_slice().try_into().unwrap();
+        let sig: [u8; 64] = m["ed25519_sig"].as_slice().try_into().unwrap();
+        assert!(ed25519::verify(&pk, canonical, &sig).is_ok());
+        // P-256: SEC1 公開鍵で canonical への DER 署名が verify できる（契約は検証成功）。
+        assert!(p256_ecdsa::verify(&m["p256_sec1"], canonical, &m["p256_der_sig"]).is_ok());
+
+        // negative: canonical を1バイト改ざんすると両署名とも検証失敗。
+        let mut tampered = canonical.clone();
+        tampered[10] ^= 0x01;
+        assert!(ed25519::verify(&pk, &tampered, &sig).is_err());
+        assert!(p256_ecdsa::verify(&m["p256_sec1"], &tampered, &m["p256_der_sig"]).is_err());
+    }
+
+    fn from_hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]

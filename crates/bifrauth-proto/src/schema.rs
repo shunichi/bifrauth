@@ -104,8 +104,14 @@ impl TextPolicy {
         BIDI_CONTROL.contains(&c)
     }
 
-    /// 入力が既に NFC 形かを判定する（`==` は使わず code point 列を直接比較）。
-    /// 呼び出し前に未割当（16.0 Cn）を拒否済みであること（正規化安定性の前提）。
+    /// 入力が既に NFC 形かを判定する。呼び出し前に未割当（16.0 Cn）を拒否済みであること
+    /// （正規化安定性の前提）。
+    ///
+    /// NFC 変換結果の code point 列と入力の code point 列を iterator で比較する。
+    /// Rust の `str`/`String` の `==` は**バイト（コードユニット）厳密**なので `s == s.nfc().collect::<String>()`
+    /// でも判定は正しいが、中間 String を確保しないため iterator の `eq` を使う（割当回避）。
+    /// なお Swift 側は `String ==` が**正準等価**のため使えず、`unicodeScalars`/`utf8` の生列比較が必須
+    /// （プロファイル §7.1）。この差異は言語ごとに理由が異なる点に注意。
     fn is_nfc(s: &str) -> bool {
         s.nfc().eq(s.chars())
     }
@@ -609,6 +615,85 @@ mod tests {
         let mut c = sample_challenge();
         c.linux_device_name = "ws\u{0378}".into();
         assert_eq!(c.encode(), Err(SchemaError::Unassigned { key: 6 }));
+    }
+
+    /// cross-language ベクタ（`spec/vectors/text_policy.tsv`）に対し、Rust をoracleとして
+    /// TextPolicy の結果が期待カテゴリと一致することを検査する。Swift は同じ fixture を読む。
+    #[test]
+    fn text_policy_vectors_conformance() {
+        const TSV: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../spec/vectors/text_policy.tsv"
+        ));
+        let mut checked = 0;
+        for line in TSV.lines() {
+            let line = line.trim_end();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let cols: Vec<&str> = line.split('\t').collect();
+            assert!(cols.len() >= 3, "malformed vector line: {line:?}");
+            let (id, expected, scalars) = (cols[0], cols[1], cols[2]);
+            let s: String = scalars
+                .split_whitespace()
+                .map(|h| char::from_u32(u32::from_str_radix(h, 16).unwrap()).unwrap())
+                .collect();
+            // 長さ制約は別枠なので min=0/max 大で無効化し、テキスト内容ポリシーだけを見る。
+            let got = match TextPolicy::check(&s, 0, 0, 8192, false) {
+                Ok(()) => "ok",
+                Err(SchemaError::NotNfc { .. }) => "not_nfc",
+                Err(SchemaError::Unassigned { .. }) => "unassigned",
+                Err(SchemaError::BadText { .. }) => "bad_text",
+                Err(SchemaError::BadLength { .. }) => "bad_length",
+                Err(e) => panic!("unexpected error for {id}: {e:?}"),
+            };
+            assert_eq!(got, expected, "vector {id}: got {got}, expected {expected}");
+            checked += 1;
+        }
+        assert!(checked >= 10, "expected many vectors, got {checked}");
+    }
+
+    fn from_hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// golden メッセージ（`spec/vectors/messages_golden.tsv`）が decode でき、かつ
+    /// 再 encode すると同一 canonical バイト列に戻ることを検査する（両方向・安定性）。
+    #[test]
+    fn messages_golden_conformance() {
+        const TSV: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../spec/vectors/messages_golden.tsv"
+        ));
+        let mut checked = 0;
+        for line in TSV.lines() {
+            let line = line.trim_end();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (id, hex) = line.split_once('\t').expect("id<TAB>hex");
+            let bytes = from_hex(hex);
+            match id {
+                "challenge_v1" => {
+                    let m = Challenge::decode(&bytes).expect("decode challenge");
+                    assert_eq!(m.encode().unwrap(), bytes, "challenge re-encode");
+                }
+                "envelope_v1" => {
+                    let m = Envelope::decode(&bytes).expect("decode envelope");
+                    assert_eq!(m.encode().unwrap(), bytes, "envelope re-encode");
+                }
+                "response_v1" => {
+                    let m = Response::decode(&bytes).expect("decode response");
+                    assert_eq!(m.encode().unwrap(), bytes, "response re-encode");
+                }
+                other => panic!("unknown golden id: {other}"),
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 3, "expected 3 golden messages");
     }
 
     #[test]

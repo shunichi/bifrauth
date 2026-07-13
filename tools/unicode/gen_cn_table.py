@@ -16,6 +16,9 @@ import sys
 
 SOURCE_URL = "https://www.unicode.org/Public/16.0.0/ucd/extracted/DerivedGeneralCategory.txt"
 UNICODE_VERSION = "16.0.0"
+# 入力を機械的に固定する。別バージョン（例 Unicode 17.0）を渡しても 16.0 として生成しないよう、
+# 生の SHA-256 とヘッダの版を検査し、不一致なら生成を拒否する。
+EXPECTED_SHA256 = "7676ab755a41ef82108460238569e60ad65c191ddafe61b36c6765ec1353f293"
 
 
 def parse_cn_ranges(text):
@@ -49,7 +52,16 @@ def main():
         sys.exit("usage: gen_cn_table.py <DerivedGeneralCategory.txt>")
     raw = open(sys.argv[1], "rb").read()
     sha = hashlib.sha256(raw).hexdigest()
-    ranges = parse_cn_ranges(raw.decode("utf-8"))
+    if sha != EXPECTED_SHA256:
+        sys.exit(
+            f"error: input SHA-256 {sha} != expected {EXPECTED_SHA256}.\n"
+            f"       expected the Unicode {UNICODE_VERSION} file from {SOURCE_URL}.\n"
+            "       別バージョンのUCDからは生成しない（wireをUnicode 16.0に固定するため）。"
+        )
+    text = raw.decode("utf-8")
+    if f"DerivedGeneralCategory-{UNICODE_VERSION}" not in text.splitlines()[0]:
+        sys.exit(f"error: 入力ヘッダに DerivedGeneralCategory-{UNICODE_VERSION} が無い")
+    ranges = parse_cn_ranges(text)
     total = sum(b - a + 1 for a, b in ranges)
 
     out = []

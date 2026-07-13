@@ -1,0 +1,19 @@
+# BifrAuth テキストポリシー cross-language ベクタ（プロファイル §7・§7.1）
+# Rust を producer/oracle として期待値を固定する。Swift は同じ fixture を consumer として読む。
+# 列: id <TAB> expected <TAB> scalars(空白区切りの16進 code point) <TAB> description
+# expected: ok | not_nfc | unassigned | bad_text
+# 検査対象は「表示テキストフィールド」のポリシー（ASCII強制なし・長さ制約は別枠）。
+ascii_ok	ok	0061 0062 0063	plain ASCII "abc"
+nfc_composed_cafe	ok	0063 0061 0066 00E9	"café"（合成形 é = U+00E9, NFC）
+non_nfc_decomposed_cafe	not_nfc	0063 0061 0066 0065 0301	"cafe"+U+0301 結合アクセント（分解形 = 非NFC）
+u16_new_assigned_todhri	ok	105C0	Todhri Letter A（Unicode 16.0 で新規割当 → 受理）
+reserved_0378	unassigned	0378	U+0378（16.0 で reserved = Cn）
+assigned_in_17_088F	unassigned	088F	U+088F（16.0 では Cn。17.0 で割当 → 16.0基準では拒否）
+private_use_co_e000	ok	E000	U+E000（Private Use = Co）。Cn のみ拒否のため受理される証拠
+noncharacter_fffe	unassigned	FFFE	U+FFFE（非文字 = Cn）
+noncharacter_fdd0	unassigned	FDD0	U+FDD0（非文字 = Cn）
+bidi_rlo_202e	bad_text	202E	U+202E RIGHT-TO-LEFT OVERRIDE（Bidi_Control）
+bidi_alm_061c	bad_text	061C	U+061C ARABIC LETTER MARK（Bidi_Control 境界）
+c0_nul_0000	bad_text	0000	U+0000 NUL（C0）
+c1_lower_0080	bad_text	0080	U+0080（C1 下端）
+c1_upper_009f	bad_text	009F	U+009F（C1 上端）

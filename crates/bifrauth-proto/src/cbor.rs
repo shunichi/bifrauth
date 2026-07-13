@@ -135,7 +135,6 @@ fn encode_value(out: &mut Vec<u8>, v: &Value) {
         Value::Map(entries) => {
             // canonical: キー昇順で出力する（呼び出し側の順序に依存しない）。
             // 内部契約: キーは一意。schema エンコーダが 0..N-1 を構築するので満たされる。
-            // duplicate を黙って落とさず、debug ビルドで検出する（非 canonical 出力の防止）。
             encode_head(out, 5, entries.len() as u64);
             let mut idx: Vec<usize> = (0..entries.len()).collect();
             idx.sort_by_key(|&i| entries[i].0);

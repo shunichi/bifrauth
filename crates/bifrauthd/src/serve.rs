@@ -4,6 +4,10 @@
 //! per-uid / total pending caps meaningful. The pool size is the hard cap on concurrent flows; excess
 //! connections wait in the kernel accept backlog (fail closed once it fills). No unbounded thread spawn.
 //!
+//! Accept errors are classified (never blindly retried): `Interrupted` retries immediately, resource
+//! exhaustion (EMFILE/ENFILE/ENOMEM/ENOBUFS) backs off briefly to avoid a hot spin, and a permanent
+//! listener error (EBADF/EINVAL/ENOTSOCK) ends that worker. [`serve`] returns when all workers have ended.
+//!
 //! Authorization: `SO_PEERCRED` — production accepts only uid == 0 (pass `|uid| uid == 0` as `authorize`);
 //! pid/gid are recorded for audit only, never used as an authenticator. A panicking connection is caught
 //! at the worker boundary so it cannot take down a worker or the daemon; the RAII cleanup guard in
@@ -12,13 +16,43 @@
 use crate::Verifier;
 use crate::session::{self, Policy, Terminal, UserResolver};
 use bifrauth_ipc::{Clock, Transport};
+use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default number of worker threads (hard cap on concurrent flows).
 pub const DEFAULT_WORKERS: usize = 8;
+
+/// Backoff after a resource-exhaustion accept error, to avoid a hot spin while fds/memory free up.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+
+/// What to do after an `accept()` error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptAction {
+    /// Transient interruption — retry immediately.
+    Retry,
+    /// Resource exhaustion or an unclassified error — back off, then retry (never hot-spin).
+    Backoff,
+    /// Permanent listener error — this worker should stop.
+    Stop,
+}
+
+/// Classify an `accept()` error. Uses the raw errno for cases without a stable `ErrorKind`.
+fn classify_accept_error(e: &io::Error) -> AcceptAction {
+    if e.kind() == io::ErrorKind::Interrupted {
+        return AcceptAction::Retry;
+    }
+    match e.raw_os_error() {
+        // EBADF, EINVAL, ENOTSOCK: the listener is gone/invalid — stop this worker.
+        Some(9) | Some(22) | Some(88) => AcceptAction::Stop,
+        // ENFILE, EMFILE, ENOMEM, ENOBUFS: resource exhaustion — back off and retry.
+        Some(23) | Some(24) | Some(12) | Some(105) => AcceptAction::Backoff,
+        // Anything else: back off rather than hot-spin or kill the pool.
+        _ => AcceptAction::Backoff,
+    }
+}
 
 /// The peer's uid from `SO_PEERCRED`, or `None` if it could not be read.
 pub fn peer_uid(stream: &UnixStream) -> Option<u32> {
@@ -81,7 +115,14 @@ where
     loop {
         let mut stream = match listener.accept() {
             Ok((s, _addr)) => s,
-            Err(_) => continue,
+            Err(e) => match classify_accept_error(&e) {
+                AcceptAction::Retry => continue,
+                AcceptAction::Backoff => {
+                    std::thread::sleep(ACCEPT_BACKOFF);
+                    continue;
+                }
+                AcceptAction::Stop => return,
+            },
         };
         // Authorization (§2). Drop the connection on a non-authorized or unreadable peer.
         match peer_uid(&stream) {
@@ -102,5 +143,38 @@ where
             )
         }));
         // A production build would emit an audit record from `_terminal` here.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accept_errors_are_classified_not_hot_spun() {
+        // Interrupted retries immediately.
+        assert_eq!(
+            classify_accept_error(&io::Error::from(io::ErrorKind::Interrupted)),
+            AcceptAction::Retry
+        );
+        // Permanent listener errors stop the worker (EBADF / EINVAL / ENOTSOCK).
+        for errno in [9, 22, 88] {
+            assert_eq!(
+                classify_accept_error(&io::Error::from_raw_os_error(errno)),
+                AcceptAction::Stop
+            );
+        }
+        // Resource exhaustion backs off (ENFILE / EMFILE / ENOMEM / ENOBUFS).
+        for errno in [23, 24, 12, 105] {
+            assert_eq!(
+                classify_accept_error(&io::Error::from_raw_os_error(errno)),
+                AcceptAction::Backoff
+            );
+        }
+        // An unclassified errno backs off rather than hot-spinning or killing the pool.
+        assert_eq!(
+            classify_accept_error(&io::Error::from_raw_os_error(9999)),
+            AcceptAction::Backoff
+        );
     }
 }

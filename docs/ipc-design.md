@@ -35,7 +35,11 @@ E2E テストは **mock-iphone アダプタ**を注入し、次を検証する:
   - **受領 FD 数がちょうど 1**（`LISTEN_FDS==1`、`sd_listen_fds` 相当）。
   - `getsockname` の path が **期待パス `/run/bifrauthd/pam.sock`**。
   - **`SO_ACCEPTCONN==1`**（listen 済み）、**`SO_DOMAIN==AF_UNIX`**、**`SO_TYPE==SOCK_STREAM`**。
-  - 検証後に受領 FD へ **`FD_CLOEXEC`** を設定（子プロセスへ漏らさず activation 環境の再解釈も防ぐ。`sd_listen_fds`相当）。
+  - 検証後に受領 FD へ **`FD_CLOEXEC`** を設定（子プロセスへ漏らさない）。
+  - **one-shot 取得**（コードレビュー第2ラウンド反映）: プロセスグローバル atomic latch で FD 3 の取得は
+    厳密に1回に限定し、2回目/並行2回目は `AlreadyClaimed` を返す（同一 raw FD を二重 own して
+    `FromRawFd` の安全条件を破る double-close を防ぐ）。成功時は `LISTEN_PID`/`LISTEN_FDS`/`LISTEN_FDNAMES`
+    を環境から削除し（`sd_listen_fds(true)` 相当）、activation 環境の再解釈を不能にする。
 - accept 後の各接続で SO_PEERCRED を確認（§2）。
 
 ## 3. フレーミング・エンコード・制限
@@ -110,7 +114,12 @@ core に **`cancel_pending(request_id)`** を追加する。次の全経路で p
 - **CleanupGuard は RAII**（`Drop`）で、通常 return だけでなく **panic/unwind でも** pending を cancel する。
   `Drop` は poison lock を回復し（`into_inner`）、`cancel_pending` は純粋な map 削除なので**再 panic せず abort
   しない**。ワーカー境界で `catch_unwind` し、1接続の panic がワーカー/デーモンを落とさない。
-- verifier mutex は poison を回復して使う（他接続の panic で全体が wedge しない）。
+- **accept エラーは分類**（コードレビュー第2ラウンド反映）: `Interrupted`=即 retry、資源枯渇
+  （EMFILE/ENFILE/ENOMEM/ENOBUFS）=短い backoff（hot-spin 回避）、恒久エラー（EBADF/EINVAL/ENOTSOCK）=
+  そのワーカー終了。全ワーカー終了で `serve` が戻る。
+- verifier mutex は poison を回復して使うが、**poison 時は全 pending を破棄して fail closed**
+  （`fail_closed_reset`）にし、poison を clear して後続フローは正常継続する（core lock 内 panic は現状
+  存在しないが、存在した場合でも中途状態を推論せず安全側へ倒す）。
 
 ## 5. 排他制御（第1ラウンド指摘1）
 

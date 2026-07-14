@@ -183,6 +183,15 @@ impl<C: Clock> Verifier<C> {
         self.consume(request_id).is_some()
     }
 
+    /// Drop **all** pending requests (fail closed). Called by the IPC layer when it recovers a poisoned
+    /// verifier lock: a panic while the lock was held means some state transition was interrupted, so the
+    /// safe response is to invalidate every in-flight challenge rather than reason about partial state.
+    /// Registered devices and the signing key are unaffected.
+    pub fn fail_closed_reset(&mut self) {
+        self.pending.clear();
+        self.per_uid.clear();
+    }
+
     /// Remove pending requests whose deadline has been reached (called before issuing).
     fn prune_expired(&mut self) {
         let now = self.clock.now_boottime_ns();

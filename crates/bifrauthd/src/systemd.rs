@@ -10,9 +10,15 @@ use rustix::net::sockopt;
 use rustix::net::{AddressFamily, SocketType};
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The first systemd-passed FD number (`SD_LISTEN_FDS_START`).
 const LISTEN_FDS_START: RawFd = 3;
+
+/// Process-global one-shot latch: the activation FD may be claimed exactly once. Guarantees that even
+/// two concurrent calls produce at most one owner of raw FD 3 (a second `from_raw_fd(3)` would create a
+/// second owner of the same descriptor, violating `FromRawFd`'s safety contract → double-close).
+static ACTIVATION_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Why the passed listener FD was rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +37,8 @@ pub enum SystemdError {
     NotStream,
     /// The FD is not bound to the expected path.
     WrongPath,
+    /// The activation FD was already claimed by an earlier call (one-shot).
+    AlreadyClaimed,
     /// A socket-inspection syscall failed.
     Os(rustix::io::Errno),
 }
@@ -65,8 +73,17 @@ pub fn validate_listener(fd: BorrowedFd<'_>, expected_path: &[u8]) -> Result<(),
 
 /// Parse the systemd socket-activation environment and return the single validated listener.
 ///
-/// Requires `LISTEN_PID` == this process and `LISTEN_FDS` == 1. Takes ownership of FD 3.
+/// **One-shot.** The first call claims raw FD 3; any later call (or a concurrent second call) returns
+/// [`SystemdError::AlreadyClaimed`] without touching the FD, so there is only ever one owner. On a
+/// successful claim the activation variables are removed from the environment (equivalent to
+/// `sd_listen_fds(true)`), so the FD cannot be re-interpreted by anything downstream. Requires
+/// `LISTEN_PID` == this process and `LISTEN_FDS` == 1; takes ownership of FD 3.
 pub fn listener_from_env(expected_path: &[u8]) -> Result<UnixListener, SystemdError> {
+    // Latch first: whoever flips false→true is the sole claimant. A failed claim still consumes the
+    // one-shot (activation is attempted once; a misconfig means the daemon exits).
+    if ACTIVATION_CLAIMED.swap(true, Ordering::SeqCst) {
+        return Err(SystemdError::AlreadyClaimed);
+    }
     let listen_pid: i32 = std::env::var("LISTEN_PID")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -86,10 +103,18 @@ pub fn listener_from_env(expected_path: &[u8]) -> Result<UnixListener, SystemdEr
     // SAFETY: systemd guarantees FD 3 is open when LISTEN_FDS==1; validate before returning ownership.
     let borrowed = unsafe { BorrowedFd::borrow_raw(LISTEN_FDS_START) };
     validate_listener(borrowed, expected_path)?;
-    // Set FD_CLOEXEC so the listener is not leaked into child processes and the activation environment
-    // cannot be re-interpreted downstream (matches `sd_listen_fds`).
+    // Set FD_CLOEXEC so the listener is not leaked into child processes.
     rustix::io::fcntl_setfd(borrowed, rustix::io::FdFlags::CLOEXEC)?;
-    // SAFETY: FD 3 is a valid, validated listening socket that we now take sole ownership of.
+    // Consume the activation environment (sd_listen_fds(true) equivalent) so it cannot be re-interpreted.
+    // SAFETY: this runs once at startup, before any worker threads are spawned, so the non-thread-safe
+    // env mutation has no concurrent reader/writer.
+    unsafe {
+        std::env::remove_var("LISTEN_PID");
+        std::env::remove_var("LISTEN_FDS");
+        std::env::remove_var("LISTEN_FDNAMES");
+    }
+    // SAFETY: FD 3 is a valid, validated listening socket, claimed exactly once (the one-shot latch), that
+    // we now take sole ownership of.
     Ok(unsafe { UnixListener::from_raw_fd(LISTEN_FDS_START) })
 }
 
@@ -146,5 +171,17 @@ mod tests {
             Err(SystemdError::NotListening)
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn listener_from_env_is_one_shot() {
+        // This is the only test that touches the process-global claim latch. The first call fails for
+        // lack of a real activation environment (no LISTEN_PID etc.), but it still consumes the one-shot;
+        // every later call is refused regardless of environment, so raw FD 3 can never gain a second owner.
+        let _first = listener_from_env(b"/run/bifrauthd/pam.sock");
+        assert!(matches!(
+            listener_from_env(b"/run/bifrauthd/pam.sock"),
+            Err(SystemdError::AlreadyClaimed)
+        ));
     }
 }

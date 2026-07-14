@@ -154,8 +154,22 @@ mod tests {
     use crate::clock::BoottimeClock;
     use std::os::unix::net::UnixStream;
 
+    /// These tests exercise the deadline path, which sets socket timeouts. A sandbox may forbid
+    /// `setsockopt(SO_RCVTIMEO/SO_SNDTIMEO)` (PermissionDenied); the *capability*, not the security
+    /// behavior, is environment-gated, so we skip only when timeouts cannot be set. Normal CI runs them.
+    fn timeouts_supported() -> bool {
+        match UnixStream::pair() {
+            Ok((a, _)) => a.set_read_timeout(Some(Duration::from_millis(50))).is_ok(),
+            Err(_) => false,
+        }
+    }
+
     #[test]
     fn round_trips_over_a_real_unix_socket() {
+        if !timeouts_supported() {
+            eprintln!("skipping: socket timeouts not permitted in this environment");
+            return;
+        }
         let (mut a, mut b) = UnixStream::pair().unwrap();
         let clock = BoottimeClock;
         let deadline = Deadline::overall(&clock);
@@ -180,6 +194,10 @@ mod tests {
 
     #[test]
     fn a_clean_peer_close_reads_as_eof() {
+        if !timeouts_supported() {
+            eprintln!("skipping: socket timeouts not permitted in this environment");
+            return;
+        }
         let (a, mut b) = UnixStream::pair().unwrap();
         let clock = BoottimeClock;
         drop(a); // peer closes with nothing sent

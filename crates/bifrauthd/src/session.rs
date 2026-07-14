@@ -276,19 +276,30 @@ where
     decode(&bytes).map_err(|_| ())
 }
 
+/// Lock the verifier, recovering a **poisoned** lock fail-closed. A poisoned lock means a panic happened
+/// while the lock was held. No such panic point exists in the current core, but rather than rely on that,
+/// on recovery we drop all pending requests ([`Verifier::fail_closed_reset`]) rather than reason about
+/// interrupted state, then clear the poison so subsequent flows proceed normally.
+fn lock_verifier<C: Clock>(
+    verifier: &Mutex<Verifier<C>>,
+) -> std::sync::MutexGuard<'_, Verifier<C>> {
+    match verifier.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            guard.fail_closed_reset();
+            verifier.clear_poison();
+            guard
+        }
+    }
+}
+
 /// Run a closure while holding the verifier lock for the shortest possible time.
-///
-/// The lock is **poison-recovered** (`into_inner`): a panic in some other connection must not
-/// permanently wedge the verifier for everyone. The verifier's own invariants hold across a panic
-/// because every mutation is a single `&mut self` state transition that either completes or leaves the
-/// maps consistent (a half-updated `pending`/`per_uid` pair is not produced by any single method).
 fn with_verifier<C: Clock, X>(
     verifier: &Mutex<Verifier<C>>,
     f: impl FnOnce(&mut Verifier<C>) -> X,
 ) -> X {
-    let mut guard = verifier
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = lock_verifier(verifier);
     f(&mut guard)
 }
 
@@ -339,12 +350,8 @@ impl<C: Clock> Drop for CleanupGuard<'_, C> {
     fn drop(&mut self) {
         if self.armed {
             let rid = self.request_id;
-            // Poison-recovering, panic-free best-effort cancel (see the type doc).
-            let mut v = self
-                .verifier
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            v.cancel_pending(&rid);
+            // Poison-recovering (fail closed), panic-free best-effort cancel (see the type doc).
+            lock_verifier(self.verifier).cancel_pending(&rid);
         }
     }
 }

@@ -560,7 +560,7 @@ mod tests {
             self.calls.set(self.calls.get() + 1);
             match &self.behavior {
                 Behavior::Iphone(ph) => Ok(ph
-                    .process(envelope)
+                    .sign_skipping_number_matching(envelope)
                     .expect("mock iphone processes envelope")),
                 Behavior::Err(e) => Err(e.clone()),
                 Behavior::Panic => panic!("transport panic (fault injection)"),
@@ -612,7 +612,7 @@ mod tests {
             *self.recorded.borrow_mut() = Some((ch.target_username.clone(), ch.target_uid));
             Ok(self
                 .ph
-                .process(envelope)
+                .sign_skipping_number_matching(envelope)
                 .expect("mock iphone processes envelope"))
         }
     }
@@ -1061,7 +1061,7 @@ mod tests {
             }
             Ok(self
                 .ph
-                .process(envelope)
+                .sign_skipping_number_matching(envelope)
                 .expect("mock iphone processes envelope"))
         }
     }

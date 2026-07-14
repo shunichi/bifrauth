@@ -567,7 +567,7 @@ mod tests {
         assert_eq!(v.pending_count(), 1);
         assert_eq!(issued.confirmation_code.len(), 6);
 
-        let response = ph.process(&issued.envelope).unwrap();
+        let response = ph.sign_skipping_number_matching(&issued.envelope).unwrap();
         let rid = v.verify_response(&response).unwrap();
         assert_eq!(rid, issued.request_id);
         assert_eq!(v.pending_count(), 0);
@@ -577,7 +577,7 @@ mod tests {
     fn replay_is_rejected_after_consume() {
         let (mut v, ph) = setup(MockClock::new(1_000_000_000));
         let issued = v.issue_challenge(&ctx()).unwrap();
-        let response = ph.process(&issued.envelope).unwrap();
+        let response = ph.sign_skipping_number_matching(&issued.envelope).unwrap();
         assert!(v.verify_response(&response).is_ok());
         assert_eq!(
             v.verify_response(&response),
@@ -592,7 +592,9 @@ mod tests {
         let (mut v, _a) = setup(MockClock::new(1_000_000_000));
         let issued = v.issue_challenge(&ctx()).unwrap();
         let device_b = iphone(&[0x77; 32]);
-        let response = device_b.process(&issued.envelope).unwrap();
+        let response = device_b
+            .sign_skipping_number_matching(&issued.envelope)
+            .unwrap();
         assert_eq!(
             v.verify_response(&response),
             Err(VerifyError::SignatureInvalid)
@@ -608,7 +610,7 @@ mod tests {
     fn hash_mismatch_is_rejected_and_consumed() {
         let (mut v, ph) = setup(MockClock::new(1_000_000_000));
         let issued = v.issue_challenge(&ctx()).unwrap();
-        let response = ph.process(&issued.envelope).unwrap();
+        let response = ph.sign_skipping_number_matching(&issued.envelope).unwrap();
         // Tamper the signed_payload_hash (still schema-valid) and re-encode.
         let mut r = Response::decode(&response).unwrap();
         r.signed_payload_hash[0] ^= 0x01;
@@ -625,7 +627,7 @@ mod tests {
         let clock = MockClock::new(1_000_000_000);
         let (mut v, ph) = setup(clock.clone());
         let issued = v.issue_challenge(&ctx()).unwrap(); // ttl 30s
-        let response = ph.process(&issued.envelope).unwrap();
+        let response = ph.sign_skipping_number_matching(&issued.envelope).unwrap();
         // Advance to exactly the deadline: now == deadline must be treated as expired.
         clock.advance(30 * 1_000_000_000);
         assert_eq!(v.verify_response(&response), Err(VerifyError::Expired));
@@ -637,7 +639,7 @@ mod tests {
         let clock = MockClock::new(1_000_000_000);
         let (mut v, ph) = setup(clock.clone());
         let issued = v.issue_challenge(&ctx()).unwrap();
-        let response = ph.process(&issued.envelope).unwrap();
+        let response = ph.sign_skipping_number_matching(&issued.envelope).unwrap();
         clock.advance(30 * 1_000_000_000 - 1); // one ns before the deadline
         assert!(v.verify_response(&response).is_ok());
     }
@@ -648,7 +650,7 @@ mod tests {
         let mut v = Verifier::new(VERIFIER_SEED, clock);
         let ph = iphone(&DEVICE_SEED); // NOT registered
         let issued = v.issue_challenge(&ctx()).unwrap();
-        let response = ph.process(&issued.envelope).unwrap();
+        let response = ph.sign_skipping_number_matching(&issued.envelope).unwrap();
         assert_eq!(
             v.verify_response(&response),
             Err(VerifyError::UnregisteredDevice)
@@ -660,7 +662,7 @@ mod tests {
     fn unknown_request_id_after_restart_is_rejected() {
         let (mut v, ph) = setup(MockClock::new(1_000_000_000));
         let issued = v.issue_challenge(&ctx()).unwrap();
-        let response = ph.process(&issued.envelope).unwrap();
+        let response = ph.sign_skipping_number_matching(&issued.envelope).unwrap();
         // A fresh verifier (simulating a restart) has no pending state.
         let mut v2 = Verifier::new(VERIFIER_SEED, MockClock::new(1_000_000_000));
         v2.register_device(UID, IPHONE_DEV, &ph.device_public_key_sec1())
@@ -728,7 +730,9 @@ mod tests {
         ));
         // Consume one via a wrong-key (valid DER) response -> SignatureInvalid but consumed.
         let device_b = iphone(&[0x77; 32]);
-        let response = device_b.process(&first.unwrap().envelope).unwrap();
+        let response = device_b
+            .sign_skipping_number_matching(&first.unwrap().envelope)
+            .unwrap();
         assert_eq!(
             v.verify_response(&response),
             Err(VerifyError::SignatureInvalid)
@@ -770,7 +774,7 @@ mod tests {
         let (mut v, ph) = setup(MockClock::new(1_000_000_000));
         v.revoke_device(UID, IPHONE_DEV).unwrap();
         let issued = v.issue_challenge(&ctx()).unwrap();
-        let response = ph.process(&issued.envelope).unwrap();
+        let response = ph.sign_skipping_number_matching(&issued.envelope).unwrap();
         assert_eq!(
             v.verify_response(&response),
             Err(VerifyError::RevokedDevice)
@@ -832,7 +836,7 @@ mod tests {
             .unwrap();
         v.replace_devices(b.build()).unwrap();
         let issued = v.issue_challenge(&ctx()).unwrap();
-        let response = ph.process(&issued.envelope).unwrap();
+        let response = ph.sign_skipping_number_matching(&issued.envelope).unwrap();
         assert!(v.verify_response(&response).is_ok());
     }
 
@@ -843,7 +847,7 @@ mod tests {
         // (RevokedDevice) and consumed — the active snapshot's state must not linger.
         let (mut v, ph) = setup(MockClock::new(1_000_000_000));
         let issued = v.issue_challenge(&ctx()).unwrap();
-        let response = ph.process(&issued.envelope).unwrap();
+        let response = ph.sign_skipping_number_matching(&issued.envelope).unwrap();
         // Swap in a snapshot where the same device is revoked.
         let mut b = DeviceSnapshot::builder();
         b.add(UID, IPHONE_DEV, &ph.device_public_key_sec1(), true)
@@ -854,5 +858,43 @@ mod tests {
             Err(VerifyError::RevokedDevice)
         );
         assert_eq!(v.pending_count(), 0);
+    }
+
+    #[test]
+    fn number_matching_client_roundtrip_socket_free() {
+        // task 0011 / P5 (§18.1 "generation and matching"), without a socket: issue a challenge, read the
+        // displayed code (IssuedChallenge.confirmation_code == the value PAM shows), have the mock iPhone
+        // match the *typed* code and Face ID succeed, then verify. A wrong typed code produces no response.
+        use mock_iphone::{FaceId, ManualClock};
+        let (mut v, ph) = setup(MockClock::new(1_000_000_000));
+        let issued = v.issue_challenge(&ctx()).unwrap();
+
+        // Happy path: the user types the displayed code into the iPhone.
+        let response = ph
+            .begin_approval(&issued.envelope, ManualClock::new(0), 1_000)
+            .unwrap()
+            .enter_code(&issued.confirmation_code)
+            .unwrap()
+            .face_id(FaceId::Success)
+            .unwrap()
+            .sign()
+            .unwrap();
+        assert_eq!(v.verify_response(&response), Ok(issued.request_id));
+
+        // Wrong typed code: the iPhone never signs, so there is nothing to submit to the verifier.
+        let issued2 = v.issue_challenge(&ctx()).unwrap();
+        let wrong = if issued2.confirmation_code == "000000" {
+            "111111"
+        } else {
+            "000000"
+        };
+        let matched = ph
+            .begin_approval(&issued2.envelope, ManualClock::new(0), 1_000)
+            .unwrap()
+            .enter_code(wrong);
+        assert!(
+            matched.err().is_some(),
+            "wrong code must not produce a signature"
+        );
     }
 }

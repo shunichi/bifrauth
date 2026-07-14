@@ -22,7 +22,7 @@ use crate::serve::{Shared, serve};
 use crate::session::{Policy, ResolvedIdentity, UserResolver};
 use bifrauth_ipc::wire::{AuthRequest, ConfirmationCode, DisplayAck, Outcome, OutcomeCode};
 use bifrauth_ipc::{Clock, Deadline, Transport, TransportError, frame};
-use mock_iphone::MockIphone;
+use mock_iphone::{FaceId, ManualClock, MockIphone};
 use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -45,14 +45,37 @@ impl Clock for FixedClock {
     }
 }
 
-struct IphoneTransport {
-    ph: MockIphone,
+/// What the "user" types into the iPhone and how Face ID resolves. Set by the client thread (playing the
+/// user) after it reads the displayed ConfirmationCode, before it sends DisplayAck — so the server-side
+/// Transport reads it only once it is set (the socket round-trip + Mutex order the write before the read).
+#[derive(Clone)]
+struct UserInput {
+    entered_code: String,
+    faceid: FaceId,
 }
-impl Transport for IphoneTransport {
+
+/// The faithful device path: drives [`MockIphone::begin_approval`] with an **externally supplied**
+/// user-entered code (never the code-skipping skeleton), proving the normal Transport path performs
+/// number matching. On any approval failure (wrong code, Face ID denied) it returns no bytes.
+struct NumberMatchingTransport {
+    ph: MockIphone,
+    user_input: Arc<Mutex<UserInput>>,
+}
+impl Transport for NumberMatchingTransport {
     fn dispatch(&self, envelope: &[u8], _deadline: Deadline) -> Result<Vec<u8>, TransportError> {
-        self.ph
-            .process(envelope)
-            .map_err(|_| TransportError::Failed)
+        let input = self.user_input.lock().unwrap().clone();
+        // A permissive local approval window (never expires here); timeout is covered by in-crate tests.
+        let approval = self
+            .ph
+            .begin_approval(envelope, ManualClock::new(0), u64::MAX)
+            .map_err(|_| TransportError::Failed)?;
+        let matched = approval
+            .enter_code(&input.entered_code)
+            .map_err(|_| TransportError::Failed)?;
+        let approved = matched
+            .face_id(input.faceid)
+            .map_err(|_| TransportError::Failed)?;
+        approved.sign().map_err(|_| TransportError::Failed)
     }
 }
 
@@ -143,14 +166,42 @@ fn auth_request(user: &str) -> Vec<u8> {
     .unwrap()
 }
 
-/// Drive one full client flow over the socket; returns the Outcome code or Err on any I/O failure.
-fn client_flow(path: &Path, user: &str) -> Result<OutcomeCode, ()> {
+/// What code the client (playing the user) types into the iPhone after reading the Linux display.
+#[derive(Clone, Copy)]
+enum TypedCode {
+    /// Type the confirmation code as displayed (the faithful happy path).
+    AsDisplayed,
+    /// Type a deliberately wrong code (number-matching failure).
+    Wrong,
+}
+
+/// Drive one full client flow over the socket. The client reads the displayed ConfirmationCode, then —
+/// playing the user — writes the code it will "type into the iPhone" into `user_input` before sending
+/// DisplayAck, so the server-side number-matching Transport matches against the display value (never the
+/// envelope). Returns the Outcome code or Err on any I/O failure.
+fn client_flow(
+    path: &Path,
+    user: &str,
+    user_input: &Arc<Mutex<UserInput>>,
+    typed: TypedCode,
+) -> Result<OutcomeCode, ()> {
     let clock = bifrauth_ipc::BoottimeClock;
     let dl = Deadline::after_secs(&clock, 15);
     let mut s = UnixStream::connect(path).map_err(|_| ())?;
     frame::write_message(&mut s, &auth_request(user), dl, &clock).map_err(|_| ())?;
     let cc = frame::read_message(&mut s, dl, &clock).map_err(|_| ())?;
     let cc = ConfirmationCode::decode(&cc).map_err(|_| ())?;
+
+    // The user reads the displayed code and types it (or a wrong one) into the iPhone.
+    let entered_code = match typed {
+        TypedCode::AsDisplayed => cc.confirmation_code.clone(),
+        TypedCode::Wrong => wrong_code(&cc.confirmation_code),
+    };
+    *user_input.lock().unwrap() = UserInput {
+        entered_code,
+        faceid: FaceId::Success,
+    };
+
     let ack = DisplayAck {
         request_id: cc.request_id,
         conversation_succeeded: true,
@@ -162,8 +213,17 @@ fn client_flow(path: &Path, user: &str) -> Result<OutcomeCode, ()> {
     Outcome::decode(&out).map(|o| o.result).map_err(|_| ())
 }
 
+/// A 6-digit code guaranteed to differ from `code`.
+fn wrong_code(code: &str) -> String {
+    let first = code.as_bytes()[0];
+    let flipped = if first == b'0' { b'1' } else { b'0' };
+    let mut w = code.as_bytes().to_vec();
+    w[0] = flipped;
+    String::from_utf8(w).unwrap()
+}
+
 #[test]
-fn registered_device_succeeds_then_revoked_device_is_denied_over_the_socket() {
+fn number_matching_over_the_socket_success_wrong_code_and_revoked() {
     if !timeouts_supported() {
         eprintln!("skipping: this environment does not permit socket timeouts");
         return;
@@ -178,16 +238,23 @@ fn registered_device_succeeds_then_revoked_device_is_denied_over_the_socket() {
     let mut verifier = Verifier::new(VERIFIER_SEED, FixedClock(1_000_000_000));
     verifier.replace_devices(reg.load_all().unwrap()).unwrap();
 
+    let user_input = Arc::new(Mutex::new(UserInput {
+        entered_code: "000000".to_string(),
+        faceid: FaceId::Success,
+    }));
     let shared = Arc::new(Shared {
         verifier: Mutex::new(verifier),
         clock: FixedClock(1_000_000_000),
-        transport: IphoneTransport { ph: iphone() },
+        transport: NumberMatchingTransport {
+            ph: iphone(),
+            user_input: Arc::clone(&user_input),
+        },
         policy: policy(),
         resolver: resolver(),
         authorize: |_uid: u32| true, // production uses |uid| uid == 0; the test runs unprivileged
     });
 
-    let path = temp_sock("bifrauthd-e2e-registry.sock");
+    let path = temp_sock("bifrauthd-e2e-number-matching.sock");
     let _ = std::fs::remove_file(&path);
     let listener = match UnixListener::bind(&path) {
         Ok(l) => Arc::new(l),
@@ -202,10 +269,20 @@ fn registered_device_succeeds_then_revoked_device_is_denied_over_the_socket() {
         std::thread::spawn(move || serve(l, sh, 2));
     }
 
-    // (1) The registered device authenticates end-to-end.
-    assert_eq!(client_flow(&path, "alice"), Ok(OutcomeCode::Success));
+    // (1) Correct code typed into the iPhone -> full number-matching round trip succeeds.
+    assert_eq!(
+        client_flow(&path, "alice", &user_input, TypedCode::AsDisplayed),
+        Ok(OutcomeCode::Success)
+    );
 
-    // (2) Revoke it in the registry, then atomically reload the snapshot into the running verifier.
+    // (2) A wrong typed code -> the iPhone declines (no signature) -> not Success.
+    assert_ne!(
+        client_flow(&path, "alice", &user_input, TypedCode::Wrong),
+        Ok(OutcomeCode::Success)
+    );
+
+    // (3) Revoke + reload: even a correct code and Face ID success is denied, because the verifier
+    //     rejects the revoked device (RevokedDevice -> Denied).
     reg.revoke(UID, IPHONE_DEV, 2000).unwrap();
     shared
         .verifier
@@ -213,9 +290,10 @@ fn registered_device_succeeds_then_revoked_device_is_denied_over_the_socket() {
         .unwrap()
         .replace_devices(reg.load_all().unwrap())
         .unwrap();
-
-    // The same device is now denied (RevokedDevice -> Denied), proving revocation reaches verification.
-    assert_eq!(client_flow(&path, "alice"), Ok(OutcomeCode::Denied));
+    assert_eq!(
+        client_flow(&path, "alice", &user_input, TypedCode::AsDisplayed),
+        Ok(OutcomeCode::Denied)
+    );
 
     let _ = std::fs::remove_file(&path);
 }

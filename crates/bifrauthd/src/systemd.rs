@@ -86,6 +86,9 @@ pub fn listener_from_env(expected_path: &[u8]) -> Result<UnixListener, SystemdEr
     // SAFETY: systemd guarantees FD 3 is open when LISTEN_FDS==1; validate before returning ownership.
     let borrowed = unsafe { BorrowedFd::borrow_raw(LISTEN_FDS_START) };
     validate_listener(borrowed, expected_path)?;
+    // Set FD_CLOEXEC so the listener is not leaked into child processes and the activation environment
+    // cannot be re-interpreted downstream (matches `sd_listen_fds`).
+    rustix::io::fcntl_setfd(borrowed, rustix::io::FdFlags::CLOEXEC)?;
     // SAFETY: FD 3 is a valid, validated listening socket that we now take sole ownership of.
     Ok(unsafe { UnixListener::from_raw_fd(LISTEN_FDS_START) })
 }

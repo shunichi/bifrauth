@@ -10,8 +10,12 @@ Documentation=file:docs/ipc-design.md
 Requires=bifrauthd.socket
 After=bifrauthd.socket
 
+# NOTE: this daemon is not yet functional — `bifrauthd` currently validates the activation FD and exits
+# (the transport link "B" and the username->uid resolver are still open). Do not install this unit as a
+# working service yet. Type is `simple` because sd_notify(READY=1)/watchdog is not implemented; switch to
+# Type=notify only once readiness notification lands.
 [Service]
-Type=notify
+Type=simple
 ExecStart=/usr/lib/bifrauth/bifrauthd
 User=root
 # Socket activation passes exactly one FD; the daemon verifies it.

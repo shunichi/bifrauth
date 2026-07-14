@@ -144,8 +144,8 @@ where
         Err(_e) => return Terminal::ClosedBeforeIssue(PreIssueReason::IssueFailed),
     };
 
-    // From here a pending request exists: arm the cleanup guard for every abnormal exit.
-    let mut guard = CleanupGuard::new(issued.request_id);
+    // From here a pending request exists: arm the RAII cleanup guard (cancels on every exit, incl. panic).
+    let mut guard = CleanupGuard::new(verifier, issued.request_id);
 
     // --- Stage 3: send ConfirmationCode. A send failure also needs cleanup (追補). ---
     let cc = ConfirmationCode {
@@ -154,7 +154,7 @@ where
     };
     let cc_bytes = match cc.encode() {
         Ok(b) => b,
-        Err(_) => return guard.cancel_and(verifier, Terminal::ClosedAfterCleanup),
+        Err(_) => return guard.cancel_and(Terminal::ClosedAfterCleanup),
     };
     if frame::write_message(
         stream,
@@ -164,7 +164,7 @@ where
     )
     .is_err()
     {
-        return guard.cancel_and(verifier, Terminal::ClosedAfterCleanup);
+        return guard.cancel_and(Terminal::ClosedAfterCleanup);
     }
 
     // --- Stage 4: read DisplayAck (same request_id only). ---
@@ -176,13 +176,12 @@ where
     ) {
         Ok(a) if a.request_id == issued.request_id => a,
         // Wrong request_id, misordered/duplicate, decode error, EOF, timeout → cleanup + close.
-        _ => return guard.cancel_and(verifier, Terminal::ClosedAfterCleanup),
+        _ => return guard.cancel_and(Terminal::ClosedAfterCleanup),
     };
     if !ack.conversation_succeeded {
         // The PAM conversation did not complete: deny (transport is never called).
         return finish_with_outcome(
             stream,
-            verifier,
             clock,
             overall,
             &mut guard,
@@ -203,7 +202,6 @@ where
             };
             return finish_with_outcome(
                 stream,
-                verifier,
                 clock,
                 overall,
                 &mut guard,
@@ -225,25 +223,16 @@ where
 
     // --- Stage 7: deliver the Outcome. If delivery fails after a Success verify, PAM sees nothing → the
     //     login fails closed; it is NOT an external success (追補B). ---
-    finish_with_outcome(
-        stream,
-        verifier,
-        clock,
-        overall,
-        &mut guard,
-        issued.request_id,
-        code,
-    )
+    finish_with_outcome(stream, clock, overall, &mut guard, issued.request_id, code)
 }
 
 /// Send the terminal `Outcome`. Any still-armed pending is cancelled first (idempotent). Distinguishes a
 /// delivered outcome from a delivery failure so the caller/tests can assert fail-closed behavior.
 fn finish_with_outcome<S, C>(
     stream: &mut S,
-    verifier: &Mutex<Verifier<C>>,
     clock: &C,
     overall: Deadline,
-    guard: &mut CleanupGuard,
+    guard: &mut CleanupGuard<'_, C>,
     request_id: [u8; 16],
     code: OutcomeCode,
 ) -> Terminal
@@ -251,7 +240,7 @@ where
     S: Read + Write + SetTimeout,
     C: Clock,
 {
-    guard.cancel(verifier);
+    guard.cancel();
     let outcome = Outcome {
         request_id,
         result: code,
@@ -288,25 +277,36 @@ where
 }
 
 /// Run a closure while holding the verifier lock for the shortest possible time.
+///
+/// The lock is **poison-recovered** (`into_inner`): a panic in some other connection must not
+/// permanently wedge the verifier for everyone. The verifier's own invariants hold across a panic
+/// because every mutation is a single `&mut self` state transition that either completes or leaves the
+/// maps consistent (a half-updated `pending`/`per_uid` pair is not produced by any single method).
 fn with_verifier<C: Clock, X>(
     verifier: &Mutex<Verifier<C>>,
     f: impl FnOnce(&mut Verifier<C>) -> X,
 ) -> X {
-    let mut guard = verifier.lock().expect("verifier mutex poisoned");
+    let mut guard = verifier
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     f(&mut guard)
 }
 
-/// Cancels a pending request on drop unless disarmed. Idempotent: [`Verifier::cancel_pending`] is a no-op
-/// once the request is gone, so calling `cancel` more than once (or after `verify_response` consumed it)
-/// is safe.
-struct CleanupGuard {
+/// An RAII guard that cancels a pending request unless disarmed. It holds the verifier so cleanup happens
+/// on **every** exit — including a panic/unwind through the connection — via [`Drop`]. Idempotent:
+/// [`Verifier::cancel_pending`] is a no-op once the request is gone, so an explicit `cancel` followed by
+/// the `Drop`, or a `Drop` after `verify_response` already consumed the request, is safe. `Drop` recovers
+/// a poisoned lock and never re-panics (a `cancel_pending` is a pure map removal), so it cannot abort.
+struct CleanupGuard<'a, C: Clock> {
+    verifier: &'a Mutex<Verifier<C>>,
     request_id: [u8; 16],
     armed: bool,
 }
 
-impl CleanupGuard {
-    fn new(request_id: [u8; 16]) -> Self {
+impl<'a, C: Clock> CleanupGuard<'a, C> {
+    fn new(verifier: &'a Mutex<Verifier<C>>, request_id: [u8; 16]) -> Self {
         CleanupGuard {
+            verifier,
             request_id,
             armed: true,
         }
@@ -318,21 +318,34 @@ impl CleanupGuard {
     }
 
     /// Cancel the pending request if still armed (idempotent), then disarm.
-    fn cancel<C: Clock>(&mut self, verifier: &Mutex<Verifier<C>>) {
+    fn cancel(&mut self) {
         if self.armed {
             self.armed = false;
-            with_verifier(verifier, |v| v.cancel_pending(&self.request_id));
+            let rid = self.request_id;
+            with_verifier(self.verifier, |v| {
+                v.cancel_pending(&rid);
+            });
         }
     }
 
     /// Cancel and return the given terminal (convenience for early returns).
-    fn cancel_and<C: Clock>(
-        &mut self,
-        verifier: &Mutex<Verifier<C>>,
-        terminal: Terminal,
-    ) -> Terminal {
-        self.cancel(verifier);
+    fn cancel_and(&mut self, terminal: Terminal) -> Terminal {
+        self.cancel();
         terminal
+    }
+}
+
+impl<C: Clock> Drop for CleanupGuard<'_, C> {
+    fn drop(&mut self) {
+        if self.armed {
+            let rid = self.request_id;
+            // Poison-recovering, panic-free best-effort cancel (see the type doc).
+            let mut v = self
+                .verifier
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            v.cancel_pending(&rid);
+        }
     }
 }
 
@@ -496,6 +509,7 @@ mod tests {
     enum Behavior {
         Iphone(MockIphone),
         Err(TransportError),
+        Panic,
     }
 
     struct MockTransport {
@@ -527,6 +541,7 @@ mod tests {
                     .process(envelope)
                     .expect("mock iphone processes envelope")),
                 Behavior::Err(e) => Err(e.clone()),
+                Behavior::Panic => panic!("transport panic (fault injection)"),
             }
         }
     }
@@ -676,6 +691,42 @@ mod tests {
         assert_eq!(terminal, Terminal::OutcomeSent(OutcomeCode::Timeout));
         assert_eq!(transport.calls(), 1);
         assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn panic_during_dispatch_still_cancels_pending_via_raii_guard() {
+        // A panic mid-flow (here, in the transport, which runs with the verifier lock released) must not
+        // leave the request pending: the RAII CleanupGuard cancels it during the unwind. The mutex is not
+        // poisoned (the panic is outside the lock), so the count is directly observable.
+        let v = verifier_with_device();
+        let clock = FixedClock(1_000_000_000);
+        let transport = MockTransport::new(Behavior::Panic);
+        let mut s = MockStream::new(frame_bytes(&auth_request("bifrauth-login", "alice")))
+            .with_responder(display_ack_responder(true));
+        // Silence the panic backtrace for this expected fault injection.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_connection(
+                &mut s,
+                &v,
+                &clock,
+                &transport,
+                &policy(),
+                &resolver(),
+                WALL_EPOCH,
+            )
+        }));
+        std::panic::set_hook(prev);
+        assert!(
+            result.is_err(),
+            "the injected transport panic must propagate"
+        );
+        assert_eq!(
+            v.lock().unwrap().pending_count(),
+            0,
+            "RAII guard must cancel the pending request during unwind"
+        );
     }
 
     #[test]
@@ -876,5 +927,152 @@ mod tests {
             ),
             Terminal::ClosedBeforeIssue(PreIssueReason::BadAuthRequest)
         );
+    }
+
+    // ---- serve(): bounded worker pool over real Unix sockets ----
+
+    use bifrauth_ipc::BoottimeClock;
+    use bifrauth_proto::{Challenge, Envelope};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::{Arc, Condvar};
+
+    /// A thread-safe transport that (a) blocks dispatch for a chosen username until a gate opens, and
+    /// (b) panics for the username "panic" — to prove parallelism and worker-panic containment.
+    struct GatedTransport {
+        ph: MockIphone,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        block_user: &'static str,
+    }
+
+    impl Transport for GatedTransport {
+        fn dispatch(
+            &self,
+            envelope: &[u8],
+            _deadline: Deadline,
+        ) -> Result<Vec<u8>, TransportError> {
+            let env = Envelope::decode(envelope).expect("valid envelope");
+            let ch = Challenge::decode(&env.canonical_challenge).expect("valid challenge");
+            if ch.target_username == "panic" {
+                panic!("transport panic for user 'panic' (fault injection)");
+            }
+            if ch.target_username == self.block_user {
+                let (m, cv) = &*self.gate;
+                let mut open = m.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+            }
+            Ok(self
+                .ph
+                .process(envelope)
+                .expect("mock iphone processes envelope"))
+        }
+    }
+
+    fn timeouts_supported() -> bool {
+        match UnixStream::pair() {
+            Ok((a, _)) => a.set_read_timeout(Some(Duration::from_millis(50))).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    fn temp_sock(name: &str) -> std::path::PathBuf {
+        let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+        std::path::Path::new(&dir).join(name)
+    }
+
+    /// Drive a full client flow over a real socket; returns the Outcome code or an error on any failure.
+    fn client_flow(path: &std::path::Path, user: &str) -> Result<OutcomeCode, ()> {
+        let clock = BoottimeClock;
+        let dl = Deadline::after_secs(&clock, 15);
+        let mut s = UnixStream::connect(path).map_err(|_| ())?;
+        frame::write_message(&mut s, &auth_request("bifrauth-login", user), dl, &clock)
+            .map_err(|_| ())?;
+        let cc = frame::read_message(&mut s, dl, &clock).map_err(|_| ())?;
+        let cc = ConfirmationCode::decode(&cc).map_err(|_| ())?;
+        let ack = DisplayAck {
+            request_id: cc.request_id,
+            conversation_succeeded: true,
+        }
+        .encode()
+        .unwrap();
+        frame::write_message(&mut s, &ack, dl, &clock).map_err(|_| ())?;
+        let out = frame::read_message(&mut s, dl, &clock).map_err(|_| ())?;
+        Outcome::decode(&out).map(|o| o.result).map_err(|_| ())
+    }
+
+    #[test]
+    fn serve_handles_connections_concurrently_and_survives_a_panic() {
+        if !timeouts_supported() {
+            eprintln!("skipping: this environment does not permit socket timeouts");
+            return;
+        }
+        const SLOW_UID: u32 = UID + 1;
+
+        // A verifier that knows two users (alice, slow) sharing one device key, plus "panic".
+        let mut v = Verifier::new(VERIFIER_SEED, FixedClock(1_000_000_000));
+        let ph = iphone(&DEVICE_SEED);
+        v.register_device(UID, IPHONE_DEV, &ph.device_public_key_sec1())
+            .unwrap();
+        v.register_device(SLOW_UID, IPHONE_DEV, &ph.device_public_key_sec1())
+            .unwrap();
+
+        let mut users = HashMap::new();
+        users.insert("alice".to_string(), UID);
+        users.insert("slow".to_string(), SLOW_UID);
+        users.insert("panic".to_string(), UID);
+
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let shared = Arc::new(crate::serve::Shared {
+            verifier: Mutex::new(v),
+            clock: FixedClock(1_000_000_000),
+            transport: GatedTransport {
+                ph,
+                gate: Arc::clone(&gate),
+                block_user: "slow",
+            },
+            policy: policy(),
+            resolver: MapResolver(users),
+            authorize: |_uid: u32| true, // production uses |uid| uid == 0; the test runs unprivileged
+        });
+
+        let path = temp_sock("bifrauthd-serve-concurrency.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = Arc::new(UnixListener::bind(&path).unwrap());
+        {
+            let l = Arc::clone(&listener);
+            let sh = Arc::clone(&shared);
+            std::thread::spawn(move || crate::serve::serve(l, sh, 4));
+        }
+
+        // Client A ("slow") will block in the server's transport until we open the gate.
+        let pa = path.clone();
+        let a = std::thread::spawn(move || client_flow(&pa, "slow"));
+
+        // Client B ("alice") must complete while A is blocked — proving the pool is concurrent and the
+        // verifier lock is not held during dispatch.
+        assert_eq!(client_flow(&path, "alice"), Ok(OutcomeCode::Success));
+
+        // A worker panic (user "panic") must be contained; a later connection still succeeds.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = client_flow(&path, "panic"); // connection dropped by the panicking worker
+        let after_panic = client_flow(&path, "alice");
+        std::panic::set_hook(prev);
+        assert_eq!(
+            after_panic,
+            Ok(OutcomeCode::Success),
+            "the pool must survive a panic"
+        );
+
+        // Release the gate; A now completes.
+        {
+            let (m, cv) = &*gate;
+            *m.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        assert_eq!(a.join().unwrap(), Ok(OutcomeCode::Success));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

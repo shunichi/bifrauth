@@ -18,13 +18,17 @@ pub struct Deadline {
 }
 
 impl Deadline {
-    /// A deadline `secs` seconds from now on the given clock. Saturates (never overflows) so a huge
-    /// `secs` simply yields a far-future deadline rather than wrapping to the past.
+    /// A deadline `secs` seconds from now on the given clock. Overflow is treated as **already expired**
+    /// (fail closed): a computation that cannot be represented must not yield a far-future
+    /// never-expiring deadline. In practice `secs` is always a small policy constant, so overflow never
+    /// occurs; the clamp only guarantees the safe direction.
     pub fn after_secs(clock: &impl Clock, secs: u64) -> Self {
         let now = clock.now_boottime_ns();
-        Deadline {
-            boottime_ns: now.saturating_add(secs.saturating_mul(1_000_000_000)),
-        }
+        let boottime_ns = secs
+            .checked_mul(1_000_000_000)
+            .and_then(|d| now.checked_add(d))
+            .unwrap_or(now); // overflow → deadline == now → remaining 0 → fail closed
+        Deadline { boottime_ns }
     }
 
     /// The overall per-connection deadline (30s from now).

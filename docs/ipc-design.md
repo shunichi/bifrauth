@@ -35,6 +35,7 @@ E2E テストは **mock-iphone アダプタ**を注入し、次を検証する:
   - **受領 FD 数がちょうど 1**（`LISTEN_FDS==1`、`sd_listen_fds` 相当）。
   - `getsockname` の path が **期待パス `/run/bifrauthd/pam.sock`**。
   - **`SO_ACCEPTCONN==1`**（listen 済み）、**`SO_DOMAIN==AF_UNIX`**、**`SO_TYPE==SOCK_STREAM`**。
+  - 検証後に受領 FD へ **`FD_CLOEXEC`** を設定（子プロセスへ漏らさず activation 環境の再解釈も防ぐ。`sd_listen_fds`相当）。
 - accept 後の各接続で SO_PEERCRED を確認（§2）。
 
 ## 3. フレーミング・エンコード・制限
@@ -48,7 +49,8 @@ E2E テストは **mock-iphone アダプタ**を注入し、次を検証する:
   これらを golden/negative ベクタに含める。
 - **タイムアウトは CLOCK_BOOTTIME の絶対 overall deadline 30 秒**（設計 §16 の総タイムアウト）+ 各段階上限
   （例: Face ID 待機 20 秒）。各 read/write は **残り overall deadline を超えない**。suspend 後も即 timeout。
-  partial な長さプレフィックス/本文・EOF も安全に終了する。
+  partial な長さプレフィックス/本文・EOF も安全に終了する。deadline 計算の overflow は**期限切れ扱い（fail closed）**
+  にし、far-future の never-expire を作らない。
 - 1 接続 = 1 認証フロー。**同一接続・同一 request_id のみ受理**。2 個目の AuthRequest や重複 Ack は
   **protocol error として接続を閉じる**。
 
@@ -98,6 +100,17 @@ core に **`cancel_pending(request_id)`** を追加する。次の全経路で p
 - `conversation_succeeded==false`、request_id 不一致、順序違反（重複 AuthRequest/Ack）、
 - EOF/接続断、decode error、各段階 timeout、Transport error、ConfirmationCode 送信失敗。
 - **遅延 Ack / 遅延 response は `UnknownOrConsumedRequest`** になる（既に cancel 済み）。
+
+## 4.2 並行モデル（コードレビュー第1ラウンド反映）
+- accept は**有界ワーカープール**（既定8スレッド）で処理する。各ワーカーは1接続ずつ担当し、遅い1フロー
+  （Face ID待ち/transport/NSS）は自分のワーカーだけを塞ぐ。プール数が同時フロー数の上限で、超過接続は
+  kernel の accept backlog で待ち（埋まれば fail closed）。**無制限 thread spawn はしない**（DoS防止）。
+  共有物（Verifier/clock/transport/policy/resolver/authorize）は `Arc` で共有。これにより §5 のロック解放と
+  §15.3 の複数 pending / per-uid 上限が実運用で意味を持つ。
+- **CleanupGuard は RAII**（`Drop`）で、通常 return だけでなく **panic/unwind でも** pending を cancel する。
+  `Drop` は poison lock を回復し（`into_inner`）、`cancel_pending` は純粋な map 削除なので**再 panic せず abort
+  しない**。ワーカー境界で `catch_unwind` し、1接続の panic がワーカー/デーモンを落とさない。
+- verifier mutex は poison を回復して使う（他接続の panic で全体が wedge しない）。
 
 ## 5. 排他制御（第1ラウンド指摘1）
 

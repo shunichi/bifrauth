@@ -291,20 +291,40 @@ mod tests {
             m.insert(k, from_hex(v));
         }
         let canonical = &m["canonical"];
-        // SHA-256 は exact 一致。
-        assert_eq!(&sha256(canonical).to_vec(), &m["sha256"]);
-        // Ed25519: 公開鍵で canonical への署名が verify できる（exact 署名だが契約は検証成功）。
         let pk: [u8; 32] = m["ed25519_pubkey"].as_slice().try_into().unwrap();
         let sig: [u8; 64] = m["ed25519_sig"].as_slice().try_into().unwrap();
+
+        // 契約1(exact 再生成): seed から鍵を作り、pubkey/sig が fixture と byte 一致。
+        let seed: [u8; 32] = m["ed25519_seed"].as_slice().try_into().unwrap();
+        let sk = ed25519::signing_key(&seed);
+        assert_eq!(ed25519::public_key(&sk).to_vec(), m["ed25519_pubkey"]);
+        assert_eq!(ed25519::sign(&sk, canonical).to_vec(), m["ed25519_sig"]);
+        // 契約1: SHA-256 も exact。
+        assert_eq!(sha256(canonical).to_vec(), m["sha256"]);
+        // 契約1: Ed25519 verify 成功。
         assert!(ed25519::verify(&pk, canonical, &sig).is_ok());
-        // P-256: SEC1 公開鍵で canonical への DER 署名が verify できる（契約は検証成功）。
+        // 契約2(検証成功): P-256 は SEC1 公開鍵で canonical への DER 署名が verify 成功。
         assert!(p256_ecdsa::verify(&m["p256_sec1"], canonical, &m["p256_der_sig"]).is_ok());
 
-        // negative: canonical を1バイト改ざんすると両署名とも検証失敗。
-        let mut tampered = canonical.clone();
-        tampered[10] ^= 0x01;
-        assert!(ed25519::verify(&pk, &tampered, &sig).is_err());
-        assert!(p256_ecdsa::verify(&m["p256_sec1"], &tampered, &m["p256_der_sig"]).is_err());
+        // negative: fixture の canonical_tampered に対して両署名とも検証失敗（Swift も同じ hex で共有）。
+        let tampered = &m["canonical_tampered"];
+        assert!(ed25519::verify(&pk, tampered, &sig).is_err());
+        assert!(p256_ecdsa::verify(&m["p256_sec1"], tampered, &m["p256_der_sig"]).is_err());
+
+        // 相互整合: crypto の canonical は messages_golden の challenge_v1 と byte 同一。
+        const GOLDEN: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../spec/vectors/messages_golden.tsv"
+        ));
+        let golden_challenge = GOLDEN
+            .lines()
+            .find_map(|l| l.strip_prefix("challenge_v1\t"))
+            .map(from_hex)
+            .expect("challenge_v1 in messages_golden");
+        assert_eq!(
+            canonical, &golden_challenge,
+            "crypto canonical == golden challenge_v1"
+        );
     }
 
     fn from_hex(s: &str) -> Vec<u8> {

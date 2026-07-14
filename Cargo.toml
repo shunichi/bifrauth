@@ -27,3 +27,4 @@ ed25519-dalek = "3.0.0"
 p256 = "0.14.0"
 sha2 = "0.11.0"
 getrandom = "0.4.3"
+rustix = { version = "1.1.4", features = ["time"] }

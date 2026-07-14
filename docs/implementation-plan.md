@@ -2,6 +2,7 @@
 
 **対象:** `docs/iphone-faceid-linux-pam-design.md`（v0.3.2）の実装
 **このドキュメントの範囲:** ソフトウェア構成、ディレクトリ構成、使用言語・技術、Linux/Mac の作業分担、実装フェーズの決定。詳細なプロトコル仕様は設計書に従う。
+**現在の到達点（進捗）:** 本ファイルは「意図」を記す。各フェーズの現在の done/残りは `docs/progress.md` を参照。
 **改訂:** v0.2 で codex レビュー第1巡の指摘（1〜9）を反映。v0.3 で第2巡の blocking（§4.2 の P-256 署名 API 固定）と軽微（§5 P3 の cross-platform 前提明示）、および第3巡の非blocking編集提案（§4.2 digest API 注記を将来判断事項へ移動）を反映。v0.4 でプロジェクト名 BifrAuth 採用に伴うコンポーネント改名（`bifrauthd` / `bifrauth-transport` / `bifrauthctl` / `pam_bifrauth` / 専用テスト PAM サービス `bifrauth-test`）を反映（技術的内容は不変、名前のみ。命名は `docs/naming.md`）。**v0.5 で §4.9（identity 解決＝NSS/uzers、glibc 動的リンク前提・musl 静的非ゴール）を追加（ユーザー承認済み・2026-07-14）。codex 設計レビュー第1巡（uzers は不在/一時エラーを区別できないとの指摘）とユーザー決定（ローカル個人利用中心・uzers 維持・区別要件は外す）を反映し、canonical pw_name 束縛・逆引き不要・NSS/PAM timeout の配備要件・cache 不使用を追記。**
 **レビュー状況:** v0.3 の内容は codex による3巡のクロスレビューで **承認済み**。v0.4 は改名のみで技術的内容は不変。**v0.5 の §4.9 は codex 設計レビュー第2巡を依頼中。**
 

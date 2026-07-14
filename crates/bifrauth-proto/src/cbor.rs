@@ -63,7 +63,7 @@ pub enum Error {
     TrailingBytes,
     /// The integer / length head is non-shortest.
     NonShortestInt,
-    /// indefinite-length（additional info 31、major 2..5）。
+    /// indefinite-length (additional info 31, major 2..5).
     IndefiniteLength,
     /// Reserved additional info (28..30).
     ReservedAdditionalInfo,

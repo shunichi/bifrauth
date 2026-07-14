@@ -1,7 +1,7 @@
 //! bifrauth-crypto — BifrAuth cryptographic primitives (P0).
 //!
 //! Operates on `bifrauth-proto` canonical bytes. Follows design §9 and profile §5.1/§6.
-//! - [`sha256`]: `signed_payload_hash = SHA-256(canonical_challenge)`。
+//! - [`sha256`]: `signed_payload_hash = SHA-256(canonical_challenge)`.
 //! - [`ed25519`]: verifier challenge signing (the envelope's 64B signature).
 //! - [`p256_ecdsa`]: verify the iPhone response signature (X9.62 DER) with strict DER + r,s in [1,n-1], SHA-256.
 //! - [`csprng`]: generation of request_id/nonce and confirmation_code.
@@ -20,7 +20,7 @@ pub enum Error {
     RandomFailed,
 }
 
-/// `SHA-256(data)`。
+/// `SHA-256(data)`.
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -144,7 +144,7 @@ pub mod csprng {
 
         #[test]
         fn code_is_zero_padded_six_digits() {
-            // v=5 → "000005"
+            // v=5 -> "000005"
             let code = confirmation_code_with(|b| {
                 *b = 5u32.to_le_bytes();
                 Ok(())

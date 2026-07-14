@@ -89,7 +89,7 @@ impl From<cbor::Error> for SchemaError {
 ///   (not via `==`). Since we have gated to 16.0-assigned, normalization stability makes the result match 16.0 even on newer Unicode versions.
 struct TextPolicy;
 
-// Bidi_Control=Yes（Unicode 16.0）: ALM, LRM, RLM, LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI
+// Bidi_Control=Yes (Unicode 16.0): ALM, LRM, RLM, LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI
 const BIDI_CONTROL: [u32; 12] = [
     0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069,
 ];
@@ -281,7 +281,7 @@ impl Challenge {
         if !(TTL_MIN..=TTL_MAX).contains(&ttl) {
             return Err(SchemaError::TtlOutOfRange);
         }
-        // confirmation_code: ASCII [0-9]{6} exact。
+        // confirmation_code: ASCII [0-9]{6} exact.
         if self.confirmation_code.len() != 6
             || !self.confirmation_code.bytes().all(|b| b.is_ascii_digit())
         {

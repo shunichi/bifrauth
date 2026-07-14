@@ -50,10 +50,29 @@ P2 へ（progress.md/計画で追跡）。
 
 ---
 
+## コードレビュー（実装レビュー）
+
+### 第1ラウンド（codex → claude）: 要修正（必須1件）
+型状態・外部入力・fail-closed・deadline 最終 gate・E2E bypass 除去・docs 追跡は計画どおりで良好。ただし
+**必須: background invalidation（明示 `invalidate()`）が未実装**。合意計画（D3・本レビュー記録）は「明示
+invalidate() / background 無効化後は署名不能」を約束したのに、mock-iphone に invalidate API/状態/テストが
+無く設計 §13.2「バックグラウンド遷移後の未処理要求を無効化」の P5 表現が欠落。
+非blocking: 自前 XOR の「constant-time」は最適化後を保証しないので「fixed-length / best-effort」と正確化。
+修正後にレビュー記録と実装の一致を再確認して再レビュー依頼。
+
+### claude 対応（再提出）:
+- 各 live state（EnvelopeChecked/CodeMatched/FaceApproved）に consuming `invalidate(self) -> Invalidated`
+  を追加。`Invalidated` は sign/遷移メソッドを持たない terminal marker（`compile_fail` doctest で invalidate
+  後に `enter_code`/`sign` が呼べないことを固定）。`FaceId::Cancelled`（Face ID prompt の取消）とは別扱い。
+  各段階から invalidate が terminal を返す runtime テストも追加。
+- `ct_eq_six` の doc を「fixed-length branchless / best-effort constant-time（低エントロピー UX 値であり
+  秘密鍵ではない）」に是正（新規依存は追加しない）。
+
 ## 主要な確定事項
 
 - **通常経路は外部 user-entered code で駆動**。`Approval` は challenge からコードを抜かず、渡された入力と
-  内部の期待コードを**定数時間**照合。受信コードは表示・自動補完・返却・ログのいずれもしない（§9.3/§13.3）。
+  内部の期待コードを**固定長・branchless（best-effort 定数時間）**で照合。受信コードは表示・自動補完・返却・
+  ログのいずれもしない（§9.3/§13.3）。
 - **型状態で単回**: 各遷移が self を consume。Signed/Rejected 後の再署名は構造的に不可能。
 - **timeout は注入 clock + 署名直前 gate**（TOCTOU 回避）。Face ID 拒否/キャンセルは注入で拒否。
 - **mock は partial**: iPhone 側 expiry/replay は未実装（TTL/replay の権威は verifier）。状態名 `EnvelopeChecked`

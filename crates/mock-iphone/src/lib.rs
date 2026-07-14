@@ -11,7 +11,8 @@
 //! - `linux_device_id` matching.
 //! - **Number matching** ([`Approval`], task 0011 / P5): the confirmation code is matched against an
 //!   **externally supplied** user-entered code (never taken from the challenge, never displayed / echoed),
-//!   with injectable Face ID outcome and an injectable approval deadline. See [`Approval`] for the
+//!   with injectable Face ID outcome, an injectable approval deadline, and an explicit
+//!   [`EnvelopeChecked::invalidate`] (background transition, §13.2). See [`Approval`] for the
 //!   verify → match → Face ID → sign state machine.
 //! - P-256 signing of canonical_challenge.
 //!
@@ -261,9 +262,19 @@ pub struct FaceApproved<C: ApprovalClock> {
     inner: ApprovalInner<C>,
 }
 
+/// Terminal marker for an approval invalidated by a **background transition** (design §13.2: "invalidate
+/// pending requests after moving to the background"). It has **no** method to sign or transition, so once
+/// a live state is `invalidate`d there is structurally no path to a signature. Distinct from
+/// [`FaceId::Cancelled`] (which cancels the Face ID prompt): this models the pending request being dropped
+/// when the app backgrounds, and can be triggered from any live state.
+pub struct Invalidated {
+    _priv: (),
+}
+
 impl<C: ApprovalClock> EnvelopeChecked<C> {
-    /// Match an **externally entered** confirmation code against the challenge's code (constant-time; the
-    /// code is never read from the caller's challenge copy and never surfaced). Consumes `self`.
+    /// Match an **externally entered** confirmation code against the challenge's code (fixed-length
+    /// best-effort constant-time; the code is never read from the caller's challenge copy and never
+    /// surfaced). Consumes `self`.
     ///
     /// NOTE (design §9.5 order): the purpose **allowlist** gate belongs *here*, before code entry, but is
     /// established at pairing (§8.2) and is tracked as a P2 completion criterion — not implemented in this
@@ -274,11 +285,25 @@ impl<C: ApprovalClock> EnvelopeChecked<C> {
         if !is_six_ascii_digits(entered) {
             return Err(ApprovalError::EnteredCodeNotSixDigits);
         }
-        // Constant-time compare over the fixed 6 bytes; do not branch on which digit differs.
+        // Fixed-length, branchless comparison over the 6 bytes; do not branch on which digit differs.
         if !ct_eq_six(entered, self.inner.challenge.confirmation_code.as_bytes()) {
             return Err(ApprovalError::CodeMismatch);
         }
         Ok(CodeMatched { inner: self.inner })
+    }
+
+    /// Invalidate this pending approval (background transition, §13.2). Consumes `self` and returns the
+    /// terminal [`Invalidated`] marker — no signature can be produced afterward.
+    ///
+    /// ```compile_fail
+    /// # use mock_iphone::{EnvelopeChecked, ManualClock};
+    /// # fn demo(a: EnvelopeChecked<ManualClock>) {
+    /// let done = a.invalidate();
+    /// let _ = done.enter_code("012345"); // ERROR: `Invalidated` has no method `enter_code`
+    /// # }
+    /// ```
+    pub fn invalidate(self) -> Invalidated {
+        Invalidated { _priv: () }
     }
 }
 
@@ -291,6 +316,12 @@ impl<C: ApprovalClock> CodeMatched<C> {
             FaceId::Success => Ok(FaceApproved { inner: self.inner }),
             FaceId::Denied | FaceId::Cancelled => Err(ApprovalError::FaceIdFailed(outcome)),
         }
+    }
+
+    /// Invalidate this pending approval (background transition, §13.2). Consumes `self`; see
+    /// [`EnvelopeChecked::invalidate`].
+    pub fn invalidate(self) -> Invalidated {
+        Invalidated { _priv: () }
     }
 }
 
@@ -311,6 +342,13 @@ impl<C: ApprovalClock> FaceApproved<C> {
             Error::ResponseBuild(s) => ApprovalError::ResponseBuild(s),
             other => ApprovalError::Envelope(other),
         })
+    }
+
+    /// Invalidate this approved-but-not-yet-signed request (background transition, §13.2). Consumes
+    /// `self`; the returned [`Invalidated`] cannot sign, so backgrounding after Face ID still yields no
+    /// signature. See [`EnvelopeChecked::invalidate`].
+    pub fn invalidate(self) -> Invalidated {
+        Invalidated { _priv: () }
     }
 }
 
@@ -339,8 +377,12 @@ fn is_six_ascii_digits(bytes: &[u8]) -> bool {
     bytes.len() == 6 && bytes.iter().all(u8::is_ascii_digit)
 }
 
-/// Constant-time equality of two 6-byte confirmation codes. Returns false for any non-6 length without
-/// leaking which position differs.
+/// Fixed-length, branchless equality of two 6-byte confirmation codes: it OR-accumulates the per-byte XOR
+/// rather than returning early on the first mismatch, so the source does not branch on which position
+/// differs. This is **best-effort** constant-time — Rust/LLVM do not *guarantee* the compiled code stays
+/// branchless — which is acceptable here because the code is a low-entropy UX value, not a secret key
+/// (design §9.3 places it as UX defense-in-depth, not an authenticator). Returns false for any non-6
+/// length.
 fn ct_eq_six(a: &[u8], b: &[u8]) -> bool {
     if a.len() != 6 || b.len() != 6 {
         return false;
@@ -682,6 +724,36 @@ mod tests {
             .unwrap();
         clock.advance(DEADLINE_NS); // now == deadline -> expired
         assert_eq!(approved.sign().err(), Some(ApprovalError::Expired));
+    }
+
+    #[test]
+    fn background_invalidation_from_each_stage_yields_a_terminal_marker() {
+        // §13.2: a background transition invalidates the pending request. invalidate() consumes the live
+        // state and returns the terminal Invalidated marker from every stage; the marker has no sign or
+        // transition method (a `compile_fail` doctest on EnvelopeChecked::invalidate proves that), so no
+        // signature can follow. Here we just confirm invalidate() is reachable from each stage.
+        let (iphone, envelope, _) = matching_setup();
+
+        let _from_envelope_checked: Invalidated = iphone
+            .begin_approval(&envelope, ManualClock::new(0), DEADLINE_NS)
+            .unwrap()
+            .invalidate();
+
+        let _from_code_matched: Invalidated = iphone
+            .begin_approval(&envelope, ManualClock::new(0), DEADLINE_NS)
+            .unwrap()
+            .enter_code(CODE)
+            .unwrap()
+            .invalidate();
+
+        let _from_face_approved: Invalidated = iphone
+            .begin_approval(&envelope, ManualClock::new(0), DEADLINE_NS)
+            .unwrap()
+            .enter_code(CODE)
+            .unwrap()
+            .face_id(FaceId::Success)
+            .unwrap()
+            .invalidate();
     }
 
     #[test]

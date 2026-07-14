@@ -145,8 +145,12 @@ pub struct Verifier<C: Clock = BoottimeClock> {
 
 impl<C: Clock> Verifier<C> {
     /// Create a verifier from a 32B Ed25519 seed and a clock. Pending requests start empty (a process
-    /// restart therefore drops all pending requests, as required by design §16). The seed is consumed
-    /// into a zeroizing signer and not retained.
+    /// restart therefore drops all pending requests, as required by design §16).
+    ///
+    /// The seed is copied into a zeroizing [`crypto::ed25519::Signer`]; no long-lived raw seed is
+    /// retained. Note that `[u8; 32]` is `Copy`, so the caller's own copy and the temporary here are
+    /// not auto-zeroized — a key-loading API taking `Zeroizing<[u8; 32]>` (best-effort zeroizing the
+    /// temporary) is a follow-up for the registry/key-load task.
     pub fn new(verifier_seed: [u8; 32], clock: C) -> Self {
         let signer = crypto::ed25519::Signer::from_seed(&verifier_seed);
         let verifier_key_id = crypto::sha256(&signer.public_key());
@@ -521,6 +525,51 @@ mod tests {
             v.issue_challenge(&ctx()),
             Err(IssueError::TooManyPendingForUid)
         ));
+    }
+
+    #[test]
+    fn total_queue_cap_is_enforced_across_uids() {
+        // Fill the total cap with MAX_PENDING_PER_UID requests each across enough uids.
+        let (mut v, _ph) = setup(MockClock::new(1_000_000_000));
+        let uids = MAX_PENDING_TOTAL / MAX_PENDING_PER_UID;
+        for uid in 0..uids as u32 {
+            for _ in 0..MAX_PENDING_PER_UID {
+                let mut c = ctx();
+                c.uid = uid;
+                v.issue_challenge(&c).unwrap();
+            }
+        }
+        assert_eq!(v.pending_count(), MAX_PENDING_TOTAL);
+        // The total cap is checked before the per-uid cap, so a fresh uid is also rejected.
+        let mut c = ctx();
+        c.uid = 9999;
+        assert!(matches!(v.issue_challenge(&c), Err(IssueError::QueueFull)));
+    }
+
+    #[test]
+    fn per_uid_counter_recovers_after_a_consumed_failure() {
+        // Fill the per-uid cap, then let one request be consumed by a failing verify; the uid can issue again.
+        let (mut v, _a) = setup(MockClock::new(1_000_000_000));
+        let mut first = None;
+        for i in 0..MAX_PENDING_PER_UID {
+            let issued = v.issue_challenge(&ctx()).unwrap();
+            if i == 0 {
+                first = Some(issued);
+            }
+        }
+        assert!(matches!(
+            v.issue_challenge(&ctx()),
+            Err(IssueError::TooManyPendingForUid)
+        ));
+        // Consume one via a wrong-key (valid DER) response -> SignatureInvalid but consumed.
+        let device_b = iphone(&[0x77; 32]);
+        let response = device_b.process(&first.unwrap().envelope).unwrap();
+        assert_eq!(
+            v.verify_response(&response),
+            Err(VerifyError::SignatureInvalid)
+        );
+        // The per-uid counter recovered, so the uid can issue again.
+        assert!(v.issue_challenge(&ctx()).is_ok());
     }
 
     #[test]

@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+# GITHUB_TOKEN を最小権限に固定する。pull_request は fork のコード（build.rs/テスト）を
+# 実行しうるため、read のみを与える（secret も使わない）。
+permissions:
+  contents: read
+
 # 直近の push だけを残して古い実行はキャンセルする。
 concurrency:
   group: ci-${{ github.ref }}
@@ -16,33 +21,27 @@ jobs:
   check:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      # サードパーティ action は 40 桁 commit SHA に pin する（.github/dependabot.yml で更新）。
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      # rust-toolchain.toml（1.97.0 + rustfmt/clippy）を rustup が自動選択する。
-      # 念のため明示的にインストールしておく。
+      # rust-toolchain.toml（1.97.0 + rustfmt/clippy）が SSOT。version を workflow に二重記載しない。
       - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Versions
         run: |
-          rustup show active-toolchain || rustup toolchain install
           rustc --version
           cargo --version
 
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
+      # Cargo.lock を CI 契約として強制する（--locked）。crate は cache 未使用なので毎回
+      # registry から取得し、Cargo.lock + checksum で固定される（vendored なのは Unicode 表と
+      # spec/vectors のみ）。
       - name: Format check
         run: cargo fmt --all --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked

@@ -1,20 +1,21 @@
-# BifrAuth 共有 crypto ベクタ（プロファイル §5/§6、設計 §9）。
-# 固定 canonical challenge（messages_golden の challenge_v1 と同一）に対する暗号値。
-# Rust を producer/oracle として固定。Swift は同じ fixture を consumer として検証に使う。
-# 契約:
-#  - SHA-256 と Ed25519 は決定論的なので exact 出力を検査できる。
-#  - P-256 ECDSA 署名は nonce に依存し実装間で byte 一致を要求しない。**検証成功**を契約とする
-#    （fixture の署名が公開鍵で canonical に対して verify できること）。
-# 鍵: verifier Ed25519 seed=ed25519_seed(下記, 公開のテスト鍵)、iPhone(mock) P-256 seed=0x55*32。
-# 契約(exact 再生成): signing_key(ed25519_seed) の public_key/sign が ed25519_pubkey/ed25519_sig と
-#   byte 一致すること（Ed25519 は決定論的）。SHA-256(canonical)==sha256。
-# 契約(検証成功): p256_sec1 で canonical への p256_der_sig が verify 成功（実装間の byte 一致は不要）。
-# negative: canonical_tampered に対しては ed25519_sig/p256_der_sig とも verify 失敗。
-# 注意: この canonical の verifier_key_id は 0x33*32 で、実 pairing 整合値ではない（crypto 単体
-#   fixture）。mock-iphone.process へは投入できない（verifier_key_id 照合で弾かれる）。
-# p256_sec1 は uncompressed(0x04, 65B)。pairing タスクで canonical 形（compressed 33B 推奨）へ固定予定。
-# canonical は messages_golden.tsv の challenge_v1 と byte 同一（テストで相互 assert）。
-# 列: name <TAB> hex
+# BifrAuth shared crypto vectors (profile §5/§6, design §9).
+# Cryptographic values over a fixed canonical challenge (identical to messages_golden's challenge_v1).
+# Rust is the producer/oracle. Swift uses the same fixture as a consumer for verification.
+# Contracts:
+#  - SHA-256 and Ed25519 are deterministic, so exact outputs can be checked.
+#  - P-256 ECDSA signatures depend on the nonce and do not require byte-identical output across
+#    implementations. The contract is **successful verification** (the fixture signature verifies
+#    against the public key over canonical).
+# Keys: verifier Ed25519 seed=ed25519_seed (below, a public test key), iPhone(mock) P-256 seed=0x55*32.
+# Contract (exact regeneration): the public_key/sign of signing_key(ed25519_seed) match ed25519_pubkey/
+#   ed25519_sig byte-for-byte (Ed25519 is deterministic). SHA-256(canonical)==sha256.
+# Contract (verify success): p256_der_sig over canonical verifies with p256_sec1 (byte-identical output not required).
+# negative: against canonical_tampered, both ed25519_sig and p256_der_sig fail verification.
+# Note: this canonical's verifier_key_id is 0x33*32, not a real pairing-consistent value (crypto-only
+#   fixture). It cannot be fed to mock-iphone.process (the verifier_key_id check would reject it).
+# p256_sec1 is uncompressed (0x04, 65B). A pairing task will fix it to a canonical form (compressed 33B recommended).
+# canonical is byte-identical to challenge_v1 in messages_golden.tsv (cross-asserted in tests).
+# Columns: name <TAB> hex
 ed25519_seed	0303030303030303030303030303030303030303030303030303030303030303
 canonical	b0007562696672617574682e6368616c6c656e67652e763101010250111111111111111111111111111111110350222222222222222222222222222222220458203333333333333333333333333333333333333333333333333333333333333333055044444444444444444444444444444444066b776f726b73746174696f6e071903e80865616c6963650968706f6c6b69742d310af60b6c686f73742e6578616d706c650c75706f6c6b69742d312e61757468656e7469636174650d1a6553f1000e1a6553f10f0f66303132333435
 canonical_tampered	b0007562696672617574692e6368616c6c656e67652e763101010250111111111111111111111111111111110350222222222222222222222222222222220458203333333333333333333333333333333333333333333333333333333333333333055044444444444444444444444444444444066b776f726b73746174696f6e071903e80865616c6963650968706f6c6b69742d310af60b6c686f73742e6578616d706c650c75706f6c6b69742d312e61757468656e7469636174650d1a6553f1000e1a6553f10f0f66303132333435

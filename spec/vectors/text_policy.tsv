@@ -1,18 +1,18 @@
-# BifrAuth テキストポリシー cross-language ベクタ（プロファイル §7・§7.1）
-# Rust を producer/oracle として期待値を固定する。Swift は同じ fixture を consumer として読む。
-# 列: id <TAB> expected <TAB> scalars(空白区切りの16進 code point) <TAB> description
+# BifrAuth text-policy cross-language vectors (profile §7 / §7.1).
+# Rust is the producer/oracle that fixes the expected values. Swift reads the same fixture as a consumer.
+# Columns: id <TAB> expected <TAB> scalars(space-separated hex code points) <TAB> description
 # expected: ok | not_nfc | unassigned | bad_text
-# 検査対象は「表示テキストフィールド」のポリシー（ASCII強制なし・長さ制約は別枠）。
+# Target is the policy for "display text fields" (no ASCII-only requirement; length limits are separate).
 ascii_ok	ok	0061 0062 0063	plain ASCII "abc"
-nfc_composed_cafe	ok	0063 0061 0066 00E9	"café"（合成形 é = U+00E9, NFC）
-non_nfc_decomposed_cafe	not_nfc	0063 0061 0066 0065 0301	"cafe"+U+0301 結合アクセント（分解形 = 非NFC）
-u16_new_assigned_todhri	ok	105C0	Todhri Letter A（Unicode 16.0 で新規割当 → 受理）
-reserved_0378	unassigned	0378	U+0378（16.0 で reserved = Cn）
-assigned_in_17_088F	unassigned	088F	U+088F（16.0 では Cn。17.0 で割当 → 16.0基準では拒否）
-private_use_co_e000	ok	E000	U+E000（Private Use = Co）。Cn のみ拒否のため受理される証拠
-noncharacter_fffe	unassigned	FFFE	U+FFFE（非文字 = Cn）
-noncharacter_fdd0	unassigned	FDD0	U+FDD0（非文字 = Cn）
-# Bidi_Control 全 12 個を negative に列挙（Swift 転記漏れ防止）。
+nfc_composed_cafe	ok	0063 0061 0066 00E9	"café" (composed é = U+00E9, NFC)
+non_nfc_decomposed_cafe	not_nfc	0063 0061 0066 0065 0301	"cafe"+U+0301 combining acute (decomposed = non-NFC)
+u16_new_assigned_todhri	ok	105C0	Todhri Letter A (newly assigned in Unicode 16.0 -> accepted)
+reserved_0378	unassigned	0378	U+0378 (reserved in 16.0 = Cn)
+assigned_in_17_088F	unassigned	088F	U+088F (Cn in 16.0; assigned in 17.0 -> rejected under the 16.0 baseline)
+private_use_co_e000	ok	E000	U+E000 (Private Use = Co). Evidence it is accepted because only Cn is rejected
+noncharacter_fffe	unassigned	FFFE	U+FFFE (noncharacter = Cn)
+noncharacter_fdd0	unassigned	FDD0	U+FDD0 (noncharacter = Cn)
+# Enumerate all 12 Bidi_Control code points as negatives (avoid transcription gaps in Swift).
 bidi_061c	bad_text	061C	U+061C ARABIC LETTER MARK
 bidi_200e	bad_text	200E	U+200E LEFT-TO-RIGHT MARK
 bidi_200f	bad_text	200F	U+200F RIGHT-TO-LEFT MARK
@@ -26,9 +26,9 @@ bidi_2067	bad_text	2067	U+2067 RIGHT-TO-LEFT ISOLATE
 bidi_2068	bad_text	2068	U+2068 FIRST STRONG ISOLATE
 bidi_2069	bad_text	2069	U+2069 POP DIRECTIONAL ISOLATE
 c0_nul_0000	bad_text	0000	U+0000 NUL（C0）
-c1_lower_0080	bad_text	0080	U+0080（C1 下端）
-c1_upper_009f	bad_text	009F	U+009F（C1 上端）
-# 制御境界の受理側も固定（現 spec は C0=0000..001F と C1=0080..009F のみ拒否）。
-boundary_space_0020	ok	0020	U+0020 SPACE（C0 直後、受理）
-boundary_del_007f	ok	007F	U+007F DELETE（C0/C1 の範囲外 = 現 spec では受理。意図的）
-boundary_nbsp_00a0	ok	00A0	U+00A0 NO-BREAK SPACE（C1 直後、受理。NFC で不変）
+c1_lower_0080	bad_text	0080	U+0080 (C1 lower bound)
+c1_upper_009f	bad_text	009F	U+009F (C1 upper bound)
+# Also fix the accepted side of control boundaries (current spec rejects only C0=0000..001F and C1=0080..009F).
+boundary_space_0020	ok	0020	U+0020 SPACE (just after C0; accepted)
+boundary_del_007f	ok	007F	U+007F DELETE (outside C0/C1 = accepted under the current spec; intentional)
+boundary_nbsp_00a0	ok	00A0	U+00A0 NO-BREAK SPACE (just after C1; accepted; unchanged under NFC)

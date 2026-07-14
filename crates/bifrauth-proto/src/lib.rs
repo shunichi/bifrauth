@@ -1,11 +1,11 @@
-//! bifrauth-proto — BifrAuth のメッセージ表現と canonical CBOR。
+//! bifrauth-proto — BifrAuth message representation and canonical CBOR.
 //!
-//! 規範は `spec/cbor-profile.md`（codex クロスレビュー承認済み）。
+//! The normative spec is `spec/cbor-profile.md` (approved via codex cross-review).
 //!
-//! 公開 API は**層B の検証済みメッセージ**（[`Challenge`] / [`Response`] / [`Envelope`]）の
-//! `decode` / `encode` のみ。低レベルの canonical CBOR（層A）は [`cbor`] モジュールに
-//! `pub(crate)` で閉じ込め、外部から未検証の `Value` を直接エンコード/受理できないようにする
-//! （canonical 生成・受理の契約は schema 層でのみ保証する）。
+//! The public API is only the `decode` / `encode` of the **layer-B validated messages**
+//! ([`Challenge`] / [`Response`] / [`Envelope`]). The low-level canonical CBOR (layer A) is kept
+//! `pub(crate)` inside the [`cbor`] module so callers cannot directly encode/accept an unvalidated
+//! `Value` (the canonical generation/acceptance contract is guaranteed only by the schema layer).
 
 pub(crate) mod cbor;
 pub mod schema;

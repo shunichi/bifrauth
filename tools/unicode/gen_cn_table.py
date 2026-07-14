@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-# BifrAuth: Unicode 16.0 の General_Category=Cn（未割当＋非文字）レンジ表を生成する。
+# BifrAuth: generate the Unicode 16.0 General_Category=Cn (unassigned + noncharacter) range table.
 #
-# 使い方（再現手順）:
+# Usage (reproduction steps):
 #   curl -fsSL https://www.unicode.org/Public/16.0.0/ucd/extracted/DerivedGeneralCategory.txt \
 #     -o DerivedGeneralCategory-16.0.txt
 #   python3 tools/unicode/gen_cn_table.py DerivedGeneralCategory-16.0.txt \
 #     > crates/bifrauth-proto/src/unicode_cn.rs
 #
-# 生成物は @generated で手編集禁止。Unicode バージョン・生成元 URL・入力の SHA-256 を
-# ファイル先頭に埋め込み、ビルド時のネットワーク取得はしない（vendored）。
-# 出力は Rust/Swift で同一集合を共有するための一次データ。
+# The output is @generated (do not edit by hand). It embeds the Unicode version, source URL, and the
+# input SHA-256 at the top, and requires no network access at build time (vendored).
+# The output is primary data for sharing the same set between the Rust and Swift implementations.
 
 import hashlib
 import sys
 
 SOURCE_URL = "https://www.unicode.org/Public/16.0.0/ucd/extracted/DerivedGeneralCategory.txt"
 UNICODE_VERSION = "16.0.0"
-# 入力を機械的に固定する。別バージョン（例 Unicode 17.0）を渡しても 16.0 として生成しないよう、
-# 生の SHA-256 とヘッダの版を検査し、不一致なら生成を拒否する。
+# Fix the input mechanically. To avoid generating from a different version (e.g. Unicode 17.0) as if
+# it were 16.0, verify the raw SHA-256 and the header version, and refuse to generate on mismatch.
 EXPECTED_SHA256 = "7676ab755a41ef82108460238569e60ad65c191ddafe61b36c6765ec1353f293"
 
 
@@ -37,7 +37,7 @@ def parse_cn_ranges(text):
             a = b = int(rng, 16)
         ranges.append((a, b))
     ranges.sort()
-    # 隣接（end+1 == 次の start）を結合してコンパクト化する。
+    # Merge adjacent ranges (end+1 == next start) to compact the table.
     merged = []
     for a, b in ranges:
         if merged and a <= merged[-1][1] + 1:
@@ -56,11 +56,11 @@ def main():
         sys.exit(
             f"error: input SHA-256 {sha} != expected {EXPECTED_SHA256}.\n"
             f"       expected the Unicode {UNICODE_VERSION} file from {SOURCE_URL}.\n"
-            "       別バージョンのUCDからは生成しない（wireをUnicode 16.0に固定するため）。"
+            "       Do not generate from a different UCD version (the wire is pinned to Unicode 16.0)."
         )
     text = raw.decode("utf-8")
     if f"DerivedGeneralCategory-{UNICODE_VERSION}" not in text.splitlines()[0]:
-        sys.exit(f"error: 入力ヘッダに DerivedGeneralCategory-{UNICODE_VERSION} が無い")
+        sys.exit(f"error: input header does not contain DerivedGeneralCategory-{UNICODE_VERSION}")
     ranges = parse_cn_ranges(text)
     total = sum(b - a + 1 for a, b in ranges)
 
@@ -70,18 +70,18 @@ def main():
     out.append(f"// Unicode version: {UNICODE_VERSION}")
     out.append(f"// Source SHA-256: {sha}")
     out.append(f"// Ranges: {len(ranges)}  (code points: {total})")
-    out.append("//! Unicode 16.0 の `General_Category=Cn`（未割当＋非文字）レンジ表（vendored）。")
+    out.append("//! Unicode 16.0 `General_Category=Cn` (unassigned + noncharacter) range table (vendored).")
     out.append("//!")
-    out.append("//! wire を Unicode 16.0 に固定するため、未割当判定はライブラリのカテゴリ表ではなく")
-    out.append("//! この表で行う（Rust/Swift 共有）。詳細は `spec/cbor-profile.md` §7.1。")
+    out.append("//! To pin the wire to Unicode 16.0, the unassigned check uses this table rather than a")
+    out.append("//! library's category table (shared by Rust/Swift). See `spec/cbor-profile.md` §7.1.")
     out.append("")
-    out.append("/// (start, end) 昇順・非重複の inclusive レンジ。")
+    out.append("/// (start, end) inclusive ranges, ascending and non-overlapping.")
     out.append("pub(crate) const CN_RANGES: &[(u32, u32)] = &[")
     for a, b in ranges:
         out.append(f"    (0x{a:04X}, 0x{b:04X}),")
     out.append("];")
     out.append("")
-    out.append("/// `cp` が Unicode 16.0 で Cn（未割当＋非文字）かを binary search で判定する。")
+    out.append("/// Returns whether `cp` is Cn (unassigned + noncharacter) in Unicode 16.0, via binary search.")
     out.append("pub(crate) fn is_cn(cp: u32) -> bool {")
     out.append("    CN_RANGES")
     out.append("        .binary_search_by(|&(lo, hi)| {")
@@ -106,14 +106,14 @@ def main():
     out.append("        assert!(is_cn(0xFDD0)); // noncharacter")
     out.append("        assert!(is_cn(0xFFFE)); // noncharacter")
     out.append("        assert!(is_cn(0x10FFFF)); // noncharacter")
-    out.append("        assert!(is_cn(0x088F)); // 16.0 では reserved（17.0 で割当）")
+    out.append("        assert!(is_cn(0x088F)); // reserved in 16.0 (assigned in 17.0)")
     out.append("    }")
     out.append("")
     out.append("    #[test]")
     out.append("    fn known_assigned_are_not_cn() {")
     out.append("        assert!(!is_cn(0x0041)); // 'A'")
-    out.append("        assert!(!is_cn(0x3042)); // 'あ'")
-    out.append("        assert!(!is_cn(0x1F600)); // 😀")
+    out.append("        assert!(!is_cn(0x3042)); // Hiragana 'a'")
+    out.append("        assert!(!is_cn(0x1F600)); // grinning face emoji")
     out.append("    }")
     out.append("}")
     print("\n".join(out))

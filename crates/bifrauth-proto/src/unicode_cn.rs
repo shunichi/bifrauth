@@ -3,12 +3,12 @@
 // Unicode version: 16.0.0
 // Source SHA-256: 7676ab755a41ef82108460238569e60ad65c191ddafe61b36c6765ec1353f293
 // Ranges: 731  (code points: 819533)
-//! Unicode 16.0 の `General_Category=Cn`（未割当＋非文字）レンジ表（vendored）。
+//! Unicode 16.0 `General_Category=Cn` (unassigned + noncharacter) range table (vendored).
 //!
-//! wire を Unicode 16.0 に固定するため、未割当判定はライブラリのカテゴリ表ではなく
-//! この表で行う（Rust/Swift 共有）。詳細は `spec/cbor-profile.md` §7.1。
+//! To pin the wire to Unicode 16.0, the unassigned check uses this table rather than a
+//! library's category table (shared by Rust/Swift). See `spec/cbor-profile.md` §7.1.
 
-/// (start, end) 昇順・非重複の inclusive レンジ。
+/// (start, end) inclusive ranges, ascending and non-overlapping.
 pub(crate) const CN_RANGES: &[(u32, u32)] = &[
     (0x0378, 0x0379),
     (0x0380, 0x0383),
@@ -743,7 +743,7 @@ pub(crate) const CN_RANGES: &[(u32, u32)] = &[
     (0x10FFFE, 0x10FFFF),
 ];
 
-/// `cp` が Unicode 16.0 で Cn（未割当＋非文字）かを binary search で判定する。
+/// Returns whether `cp` is Cn (unassigned + noncharacter) in Unicode 16.0, via binary search.
 pub(crate) fn is_cn(cp: u32) -> bool {
     CN_RANGES
         .binary_search_by(|&(lo, hi)| {
@@ -768,13 +768,13 @@ mod tests {
         assert!(is_cn(0xFDD0)); // noncharacter
         assert!(is_cn(0xFFFE)); // noncharacter
         assert!(is_cn(0x10FFFF)); // noncharacter
-        assert!(is_cn(0x088F)); // 16.0 では reserved（17.0 で割当）
+        assert!(is_cn(0x088F)); // reserved in 16.0 (assigned in 17.0)
     }
 
     #[test]
     fn known_assigned_are_not_cn() {
         assert!(!is_cn(0x0041)); // 'A'
-        assert!(!is_cn(0x3042)); // 'あ'
-        assert!(!is_cn(0x1F600)); // 😀
+        assert!(!is_cn(0x3042)); // Hiragana 'a'
+        assert!(!is_cn(0x1F600)); // grinning face emoji
     }
 }

@@ -1,47 +1,48 @@
-//! BifrAuth deterministic CBOR — 低レベル層（層A: プロファイル妥当性）。
+//! BifrAuth deterministic CBOR — low-level layer (layer A: profile validity).
 //!
-//! `spec/cbor-profile.md` の層A（BifrAuth deterministic profile validity）を実装する。
-//! 受信バイト列を**直接走査**して canonicality を強制し、decode→再encode 比較はしない。
+//! Implements layer A (BifrAuth deterministic profile validity) of `spec/cbor-profile.md`.
+//! Enforces canonicality by **scanning the incoming bytes directly**; no decode-then-reencode comparison.
 //!
-//! 実装する制約（プロファイル §1・§2・§3 の構造部分）:
-//! - 許可データモデルは uint / bstr / tstr / map / null のみ（negative・array・tag・float・
-//!   bool・undefined・null 以外の simple・indefinite・break を拒否）。
-//! - definite length のみ、preferred serialization（最短）。
-//! - map キーは uint、strict 昇順（`prev < cur`）＝順序違反と重複を同時検出。
-//! - ネスト深さ上限（本プロファイルの各メッセージは top-level map=1）。
-//! - サイズ上限を長さ head を読んだ時点で（コピー前に）検査。
-//! - trailing bytes / 複数 top-level を拒否。tstr は UTF-8 妥当性を検査。
+//! Constraints implemented (the structural part of profile §1/§2/§3):
+//! - The allowed data model is only uint / bstr / tstr / map / null (reject negative, array, tag,
+//!   float, bool, undefined, simple other than null, indefinite, and break).
+//! - Definite length only; preferred serialization (shortest).
+//! - Map keys are uint in strict ascending order (`prev < cur`), detecting order violations and duplicates at once.
+//! - Nesting-depth limit (each message in this profile is a top-level map = 1).
+//! - Check size limits when the length head is read (before copying).
+//! - Reject trailing bytes / multiple top-level values. Validate UTF-8 for tstr.
 //!
-//! テキストの NFC / 未割当 / 制御・bidi などの**内容**制約は層B（テキストポリシー）で扱う
-//! （Unicode データを要するため別モジュール）。ここは構造 canonicality に限定する。
+//! **Content** constraints such as text NFC / unassigned / control / bidi are handled in layer B
+//! (text policy), in a separate module because they need Unicode data. This layer is structural canonicality only.
 //!
-//! **本モジュールは `pub(crate)`（内部）。** [`scan_structure`] の `Ok` は「構造 canonical かつ
-//! UTF-8 妥当」までを意味し、**認証入力として妥当ではない**（NFC/テキストポリシー + 層B スキーマが
-//! 別途必要）。外部公開は `crate::schema` の検証済みデコーダ/エンコーダのみ。
+//! **This module is `pub(crate)` (internal).** An `Ok` from [`scan_structure`] means only "structurally
+//! canonical and valid UTF-8"; it is **not valid as an authentication input** (NFC/text policy + layer-B
+//! schema are also required). Only the validated decoders/encoders of `crate::schema` are public.
 //!
-//! **禁止 major の分類:** major 1（negative）/ 4（array）/ 6（tag）は初期バイトを読んだ時点で
-//! 即 [`Error::ForbiddenMajor`] を返す（ai/body を読まない）。よって例えば `0x9f`（indefinite array）や
-//! `0xd8`（tag head）は `IndefiniteLength`/`Truncated` ではなく `ForbiddenMajor` になる。いずれも
-//! fail closed で受理集合は同一。詳細な下位分類（indefinite/reserved/truncated）は**許可 major に
-//! 対してのみ**保証する（プロファイル §2 の well-formedness→型拒否順の実装上の確定）。
+//! **Classification of forbidden majors:** major 1 (negative) / 4 (array) / 6 (tag) return
+//! [`Error::ForbiddenMajor`] immediately upon reading the initial byte (without reading ai/body). So e.g.
+//! `0x9f` (indefinite array) and `0xd8` (tag head) become `ForbiddenMajor` rather than
+//! `IndefiniteLength`/`Truncated`. Both fail closed, so the accepted set is identical. The finer
+//! sub-classification (indefinite/reserved/truncated) is guaranteed **only for allowed majors** (the
+//! implementation's fixed well-formedness-then-type-reject ordering of profile §2).
 
-/// 層A のリソース境界（プロファイル §3）。スキーマ層が実値を渡す。
+/// Layer-A resource bounds (profile §3). The schema layer passes the real values.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    /// 入力全体の最大バイト数。
+    /// Maximum total input bytes.
     pub max_total: usize,
-    /// 最大ネスト深さ（top-level map = 1）。
+    /// Maximum nesting depth (top-level map = 1).
     pub max_depth: u32,
-    /// byte string 1 個の最大バイト数。
+    /// Maximum bytes for one byte string.
     pub max_bytes: usize,
-    /// text string 1 個の最大バイト数。
+    /// Maximum bytes for one text string.
     pub max_text: usize,
-    /// map の最大エントリ数。
+    /// Maximum number of map entries.
     pub max_map_entries: usize,
 }
 
 impl Default for Limits {
-    /// 汎用の緩い既定値。スキーマ層はメッセージごとの厳密値で上書きする。
+    /// Loose general-purpose defaults. The schema layer overrides with strict per-message values.
     fn default() -> Self {
         Limits {
             max_total: 8 * 1024,
@@ -53,53 +54,53 @@ impl Default for Limits {
     }
 }
 
-/// 層A の拒否理由。プロファイルの negative ベクタと対応する。
+/// Layer-A rejection reasons. Correspond to the profile's negative vectors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// head/body が途中で終端した。
+    /// The head/body ended prematurely.
     Truncated,
-    /// top-level 値の後に余剰バイトがある（複数 top-level を含む）。
+    /// There are extra bytes after the top-level value (includes multiple top-level values).
     TrailingBytes,
-    /// integer / length head が非最短表現。
+    /// The integer / length head is non-shortest.
     NonShortestInt,
     /// indefinite-length（additional info 31、major 2..5）。
     IndefiniteLength,
-    /// 予約された additional info（28..30）。
+    /// Reserved additional info (28..30).
     ReservedAdditionalInfo,
-    /// 単独の break（0xff）。
+    /// A stray break (0xff).
     UnexpectedBreak,
-    /// 許可外の major type（1=negative, 4=array, 6=tag）。
+    /// A disallowed major type (1=negative, 4=array, 6=tag).
     ForbiddenMajor(u8),
-    /// null 以外の simple / bool / undefined / float。
+    /// A simple value other than null / bool / undefined / float.
     ForbiddenSimpleOrFloat,
-    /// simple 0..=23 を 0xf8 で符号化（非最短）。
+    /// Encoding simple 0..=23 with 0xf8 (non-shortest).
     NonShortestSimple,
-    /// simple 24..=255（allowlist 外。null のみ許可）。
+    /// simple 24..=255 (outside the allowlist; only null is allowed).
     OutOfAllowlistSimple,
-    /// map キーが uint(major 0) でない。
+    /// A map key is not a uint (major 0).
     NonUintMapKey,
-    /// map キーが strict 昇順でない（順序違反または重複）。
+    /// Map keys are not strictly ascending (an order violation or duplicate).
     UnorderedOrDuplicateKey,
-    /// ネスト深さが上限を超えた。
+    /// Nesting depth exceeded the limit.
     DepthExceeded,
-    /// サイズ上限超過（コピー前に検出）。
+    /// A size limit was exceeded (detected before copying).
     TooLarge,
-    /// text string が不正な UTF-8。
+    /// A text string is invalid UTF-8.
     InvalidUtf8,
 }
 
-/// 許可データモデルの値。
+/// A value in the allowed data model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Uint(u64),
     Bytes(Vec<u8>),
     Text(String),
     Null,
-    /// map。エントリは**昇順・一意**なキーで保持する（scan はこれを強制、encode は前提とする）。
+    /// A map. Entries are held with **ascending, unique** keys (scan enforces this; encode assumes it).
     Map(Vec<(u64, Value)>),
 }
 
-// ---- エンコード（canonical 生成） ----
+// ---- Encoding (canonical generation) ----
 
 fn encode_head(out: &mut Vec<u8>, major: u8, arg: u64) {
     let mt = major << 5;
@@ -133,13 +134,13 @@ fn encode_value(out: &mut Vec<u8>, v: &Value) {
         }
         Value::Null => out.push(0xf6),
         Value::Map(entries) => {
-            // canonical: キー昇順で出力する（呼び出し側の順序に依存しない）。
-            // 内部契約: キーは一意。schema エンコーダが 0..N-1 を構築するので満たされる。
+            // canonical: emit keys in ascending order (independent of the caller's order).
+            // Internal contract: keys are unique; satisfied because schema encoders build 0..N-1.
             encode_head(out, 5, entries.len() as u64);
             let mut idx: Vec<usize> = (0..entries.len()).collect();
             idx.sort_by_key(|&i| entries[i].0);
-            // release でも有効な assert。schema エンコーダは 0..N-1 の一意キーを構築するため
-            // 通常フローで発火しない不変条件。黙って dedup すると非 canonical 出力になるため panic で防ぐ。
+            // An assert that is active in release too. Since schema encoders build unique keys 0..N-1,
+            // this invariant never fires in normal flow. Silently deduping would produce non-canonical output, so panic instead.
             assert!(
                 idx.windows(2).all(|w| entries[w[0]].0 < entries[w[1]].0),
                 "encode: map keys must be unique and this crate must only encode schema-built maps",
@@ -152,14 +153,14 @@ fn encode_value(out: &mut Vec<u8>, v: &Value) {
     }
 }
 
-/// 値を canonical CBOR バイト列へエンコードする。
+/// Encode a value into canonical CBOR bytes.
 pub fn encode(v: &Value) -> Vec<u8> {
     let mut out = Vec::new();
     encode_value(&mut out, v);
     out
 }
 
-// ---- スキャン（受信バイト列の直接 canonicality 検査 + 値の復元） ----
+// ---- Scanning (direct canonicality check of incoming bytes + value reconstruction) ----
 
 struct Scanner<'a> {
     buf: &'a [u8],
@@ -182,7 +183,7 @@ impl<'a> Scanner<'a> {
         Ok(self.take(1)?[0])
     }
 
-    /// major 0/2/3/5 の引数（値または長さ）を最短強制で読む。
+    /// Read the argument (value or length) of major 0/2/3/5 with shortest-form enforcement.
     fn read_arg(&mut self, ai: u8) -> Result<u64, Error> {
         match ai {
             0..=23 => Ok(ai as u64),
@@ -219,7 +220,7 @@ impl<'a> Scanner<'a> {
             }
             28..=30 => Err(Error::ReservedAdditionalInfo),
             31 => Err(Error::IndefiniteLength),
-            _ => unreachable!("ai は 5bit"),
+            _ => unreachable!("ai is 5 bits"),
         }
     }
 
@@ -246,17 +247,17 @@ impl<'a> Scanner<'a> {
             5 => self.read_map(ai, depth),
             6 => Err(Error::ForbiddenMajor(6)), // tag
             7 => self.read_simple(ai),
-            _ => unreachable!("major は 3bit"),
+            _ => unreachable!("major is 3 bits"),
         }
     }
 
-    /// 長さを上限と残バイトに対しコピー前に検査する。
+    /// Check the length against the limit and remaining bytes before copying.
     fn checked_len(&self, len: u64, field_max: usize) -> Result<usize, Error> {
         let n = usize::try_from(len).map_err(|_| Error::TooLarge)?;
         if n > field_max {
             return Err(Error::TooLarge);
         }
-        // 残バイトを超える宣言長はここで弾く（確保前）。
+        // Reject a declared length that exceeds the remaining bytes here (before allocation).
         if n > self.buf.len() - self.pos {
             return Err(Error::Truncated);
         }
@@ -272,20 +273,20 @@ impl<'a> Scanner<'a> {
         if count > self.limits.max_map_entries {
             return Err(Error::TooLarge);
         }
-        // 各エントリは最低 2 バイト（uint key + 1 バイト値）。確保前の粗い下限検査。
+        // Each entry is at least 2 bytes (uint key + 1-byte value). A coarse lower-bound check before allocation.
         if count.checked_mul(2).ok_or(Error::TooLarge)? > self.buf.len() - self.pos {
             return Err(Error::Truncated);
         }
         let mut entries: Vec<(u64, Value)> = Vec::with_capacity(count);
         let mut prev: Option<u64> = None;
         for _ in 0..count {
-            // キーは uint(major 0) のみ。
+            // Keys are uint (major 0) only.
             let kb = self.next_byte()?;
             if kb >> 5 != 0 {
                 return Err(Error::NonUintMapKey);
             }
             let key = self.read_arg(kb & 0x1f)?;
-            // strict 昇順 = 順序違反と重複を同時に検出。
+            // Strict ascending = detect order violations and duplicates at once.
             if let Some(p) = prev
                 && key <= p
             {
@@ -302,9 +303,9 @@ impl<'a> Scanner<'a> {
         match ai {
             22 => Ok(Value::Null),                              // 0xf6
             20 | 21 | 23 => Err(Error::ForbiddenSimpleOrFloat), // false/true/undefined
-            0..=19 => Err(Error::ForbiddenSimpleOrFloat),       // 直接 simple 0..19（null 以外）
+            0..=19 => Err(Error::ForbiddenSimpleOrFloat), // direct simple 0..19 (other than null)
             24 => {
-                // 0xf8 xx。simple 0..23 は非最短、24..255 は allowlist 外（理由を分離）。
+                // 0xf8 xx. simple 0..23 is non-shortest; 24..255 is outside the allowlist (distinct reasons).
                 let v = self.next_byte()?;
                 if v < 24 {
                     Err(Error::NonShortestSimple)
@@ -315,16 +316,17 @@ impl<'a> Scanner<'a> {
             25..=27 => Err(Error::ForbiddenSimpleOrFloat), // float16/32/64
             28..=30 => Err(Error::ReservedAdditionalInfo),
             31 => Err(Error::UnexpectedBreak),
-            _ => unreachable!("ai は 5bit"),
+            _ => unreachable!("ai is 5 bits"),
         }
     }
 }
 
-/// 受信バイト列を**層Aの構造規則**で走査し、構造 canonical なら `Value` を返す（内部 API）。
+/// Scan the incoming bytes under the **layer-A structural rules** and return a `Value` if
+/// structurally canonical (internal API).
 ///
-/// これは構造 canonicality と UTF-8 妥当性までで、**テキストの NFC/未割当や層B スキーマは含まない**。
-/// したがって `Ok` は「認証入力として妥当」を意味しない — 上位の `schema` デコーダ経由でのみ用いる。
-/// trailing bytes（複数 top-level を含む）は拒否する。
+/// This covers structural canonicality and UTF-8 validity only; it **excludes text NFC/unassigned and
+/// the layer-B schema**. So an `Ok` does not mean "valid as an authentication input" — use it only via
+/// the higher-level `schema` decoders. Rejects trailing bytes (including multiple top-level values).
 pub fn scan_structure(buf: &[u8], limits: Limits) -> Result<Value, Error> {
     if buf.len() > limits.max_total {
         return Err(Error::TooLarge);
@@ -380,7 +382,7 @@ mod tests {
 
     #[test]
     fn roundtrip_map_sorts_keys() {
-        // 入力順が降順でも encode は昇順に並べ、scan で復元できる。
+        // Even if the input order is descending, encode sorts ascending and scan can reconstruct it.
         let v = map(vec![
             (15, Value::Text("c".into())),
             (0, Value::Uint(1)),
@@ -400,12 +402,12 @@ mod tests {
 
     #[test]
     fn reject_non_shortest_uint() {
-        // 24 を 2 バイト（0x18 0x18 が最短）ではなく非最短の 0x19 0x00 0x18 で表す。
+        // Represent 24 with the non-shortest 0x19 0x00 0x18 instead of the shortest 2-byte 0x18 0x18.
         assert_eq!(
             scan_structure(&[0x19, 0x00, 0x18], limits()),
             Err(Error::NonShortestInt)
         );
-        // 0 を 0x18 0x00（非最短、0x00 が最短）
+        // 0 as 0x18 0x00 (non-shortest; 0x00 is shortest)
         assert_eq!(
             scan_structure(&[0x18, 0x00], limits()),
             Err(Error::NonShortestInt)
@@ -419,7 +421,7 @@ mod tests {
             scan_structure(&[0x5f, 0xff], limits()),
             Err(Error::IndefiniteLength)
         );
-        // 単独 break
+        // stray break
         assert_eq!(
             scan_structure(&[0xff], limits()),
             Err(Error::UnexpectedBreak)
@@ -477,12 +479,12 @@ mod tests {
 
     #[test]
     fn simple_f8_distinguishes_reasons() {
-        // 0xf8 0x00 : simple 0 を 1 バイト形式で（非最短）
+        // 0xf8 0x00 : simple 0 in 1-byte form (non-shortest)
         assert_eq!(
             scan_structure(&[0xf8, 0x00], limits()),
             Err(Error::NonShortestSimple)
         );
-        // 0xf8 0xff : simple 255（allowlist 外）
+        // 0xf8 0xff : simple 255 (outside the allowlist)
         assert_eq!(
             scan_structure(&[0xf8, 0xff], limits()),
             Err(Error::OutOfAllowlistSimple)
@@ -492,18 +494,18 @@ mod tests {
     #[test]
     fn reject_trailing_bytes() {
         let mut enc = encode(&Value::Uint(1));
-        enc.push(0x01); // 余剰 top-level
+        enc.push(0x01); // extra top-level
         assert_eq!(scan_structure(&enc, limits()), Err(Error::TrailingBytes));
     }
 
     #[test]
     fn reject_unordered_and_duplicate_keys() {
-        // {1:0, 0:0} 昇順違反
+        // {1:0, 0:0} order violation
         assert_eq!(
             scan_structure(&[0xa2, 0x01, 0x00, 0x00, 0x00], limits()),
             Err(Error::UnorderedOrDuplicateKey)
         );
-        // {0:0, 0:0} 重複
+        // {0:0, 0:0} duplicate
         assert_eq!(
             scan_structure(&[0xa2, 0x00, 0x00, 0x00, 0x00], limits()),
             Err(Error::UnorderedOrDuplicateKey)
@@ -512,7 +514,7 @@ mod tests {
 
     #[test]
     fn reject_non_uint_map_key() {
-        // {"a":0} テキストキー
+        // {"a":0} text key
         assert_eq!(
             scan_structure(&[0xa1, 0x61, b'a', 0x00], limits()),
             Err(Error::NonUintMapKey)
@@ -521,7 +523,7 @@ mod tests {
 
     #[test]
     fn reject_depth_exceeded() {
-        // max_depth=1 で map の値が map（depth2）: {0:{}}
+        // With max_depth=1, a map whose value is a map (depth 2): {0:{}}
         assert_eq!(
             scan_structure(&[0xa1, 0x00, 0xa0], limits()),
             Err(Error::DepthExceeded)
@@ -534,7 +536,7 @@ mod tests {
             max_bytes: 4,
             ..limits()
         };
-        // bstr 長 5（0x45 = major2, len5）だが上限4
+        // bstr length 5 (0x45 = major2, len5) but the limit is 4
         assert_eq!(
             scan_structure(&[0x45, 1, 2, 3, 4, 5], l),
             Err(Error::TooLarge)
@@ -543,7 +545,7 @@ mod tests {
 
     #[test]
     fn reject_declared_len_beyond_input() {
-        // bstr 長 10 だが本体が足りない → 確保前に Truncated
+        // bstr length 10 but the body is short -> Truncated before allocation
         assert_eq!(
             scan_structure(&[0x4a, 1, 2, 3], limits()),
             Err(Error::Truncated)
@@ -552,7 +554,7 @@ mod tests {
 
     #[test]
     fn reject_invalid_utf8() {
-        // tstr 長1、本体 0xff は不正 UTF-8
+        // tstr length 1, body 0xff is invalid UTF-8
         assert_eq!(
             scan_structure(&[0x61, 0xff], limits()),
             Err(Error::InvalidUtf8)
@@ -583,8 +585,8 @@ mod tests {
     }
 }
 
-/// 追加テスト（codex 中間レビュー 第1巡 指摘4〜8）: バイト厳密 table、非最短各 ai、
-/// 長さ head 境界、truncated、simple/forbidden 全分類、map 境界、fuzz smoke / roundtrip。
+/// Additional tests (codex mid-review round 1, items 4-8): byte-exact table, non-shortest per ai,
+/// length-head boundaries, truncated, all simple/forbidden classes, map boundaries, fuzz smoke / roundtrip.
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
@@ -595,7 +597,7 @@ mod boundary_tests {
 
     #[test]
     fn uint_encoding_is_byte_exact() {
-        // (値, 期待バイト列)。RFC 8949 preferred serialization。
+        // (value, expected bytes). RFC 8949 preferred serialization.
         let cases: &[(u64, &[u8])] = &[
             (23, &[0x17]),
             (24, &[0x18, 0x18]),
@@ -625,7 +627,7 @@ mod boundary_tests {
 
     #[test]
     fn non_shortest_per_ai_rejected() {
-        // 各 ai で 1 段小さい表現に収まる値 → NonShortestInt。
+        // A value that fits a one-size-smaller representation for each ai -> NonShortestInt.
         assert_eq!(
             scan_structure(&[0x18, 0x17], limits()),
             Err(Error::NonShortestInt)
@@ -649,7 +651,7 @@ mod boundary_tests {
 
     #[test]
     fn length_head_boundaries_for_bstr() {
-        // 24 バイトの bstr は 0x58 0x18 が最短。0x58 0x17（長さ23の1バイト形式）は非最短。
+        // A 24-byte bstr is shortest as 0x58 0x18. 0x58 0x17 (length 23 in 1-byte form) is non-shortest.
         let mut ok = vec![0x58, 0x18];
         ok.extend_from_slice(&[0u8; 24]);
         assert_eq!(
@@ -681,7 +683,7 @@ mod boundary_tests {
 
     #[test]
     fn huge_declared_lengths_rejected_before_alloc() {
-        // ai27 = u64::MAX を bstr 長として → 上限超過（TooLarge）。確保しない。
+        // ai27 = u64::MAX as a bstr length -> exceeds the limit (TooLarge). No allocation.
         assert_eq!(
             scan_structure(
                 &[0x5b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
@@ -689,7 +691,7 @@ mod boundary_tests {
             ),
             Err(Error::TooLarge)
         );
-        // map count = u64::MAX → 上限超過。
+        // map count = u64::MAX -> exceeds the limit.
         assert_eq!(
             scan_structure(
                 &[0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
@@ -761,12 +763,12 @@ mod boundary_tests {
             scan_structure(&[0xbf], limits()),
             Err(Error::IndefiniteLength)
         ); // map*
-        // 0x9f は major4(array)。array は初期バイトで即拒否（indefinite より先）。
+        // 0x9f is major4 (array). Arrays are rejected immediately at the initial byte (before indefinite).
         assert_eq!(
             scan_structure(&[0x9f], limits()),
             Err(Error::ForbiddenMajor(4))
         );
-        // 0xd8 は major6(tag) head。tag は即拒否（truncated より先）。
+        // 0xd8 is a major6 (tag) head. Tags are rejected immediately (before truncated).
         assert_eq!(
             scan_structure(&[0xd8], limits()),
             Err(Error::ForbiddenMajor(6))
@@ -775,7 +777,7 @@ mod boundary_tests {
 
     #[test]
     fn break_inside_map_value() {
-        // {0: <break>} → 値位置の 0xff。
+        // {0: <break>} -> 0xff at the value position.
         assert_eq!(
             scan_structure(&[0xa1, 0x00, 0xff], limits()),
             Err(Error::UnexpectedBreak)
@@ -789,7 +791,7 @@ mod boundary_tests {
 
     #[test]
     fn map_key_non_shortest_rejected() {
-        // {24-form(0): 0} キー head が非最短。
+        // {24-form(0): 0} the key head is non-shortest.
         assert_eq!(
             scan_structure(&[0xa1, 0x18, 0x00, 0x00], limits()),
             Err(Error::NonShortestInt)
@@ -798,13 +800,13 @@ mod boundary_tests {
 
     #[test]
     fn map_key_order_boundary_23_24() {
-        // {23:0, 24:0} 昇順 OK。
+        // {23:0, 24:0} ascending OK.
         let ok = [0xa2, 0x17, 0x00, 0x18, 0x18, 0x00];
         assert_eq!(
             scan_structure(&ok, limits()),
             Ok(Value::Map(vec![(23, Value::Uint(0)), (24, Value::Uint(0))]))
         );
-        // {24:0, 23:0} 逆順 → 拒否。
+        // {24:0, 23:0} reversed -> rejected.
         let bad = [0xa2, 0x18, 0x18, 0x00, 0x17, 0x00];
         assert_eq!(
             scan_structure(&bad, limits()),
@@ -818,9 +820,9 @@ mod boundary_tests {
             max_map_entries: 2,
             ..limits()
         };
-        // 2 エントリ OK。
+        // 2 entries OK.
         assert!(scan_structure(&[0xa2, 0x00, 0x00, 0x01, 0x00], l).is_ok());
-        // 3 エントリ → TooLarge。
+        // 3 entries -> TooLarge.
         assert_eq!(
             scan_structure(&[0xa3, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00], l),
             Err(Error::TooLarge)
@@ -830,7 +832,7 @@ mod boundary_tests {
     #[test]
     #[should_panic(expected = "map keys must be unique")]
     fn encode_duplicate_key_panics_in_all_profiles() {
-        // 内部契約違反（重複キー）は debug ビルドで検出する（黙って dedup しない）。
+        // An internal-contract violation (duplicate keys) is detected in all build profiles (does not silently dedup).
         let v = Value::Map(vec![(0, Value::Uint(1)), (0, Value::Uint(2))]);
         let _ = encode(&v);
     }
@@ -844,8 +846,8 @@ mod boundary_tests {
 
     #[test]
     fn ok_implies_canonical_reencode_roundtrip() {
-        // 1〜3 バイトを総当りし、Ok なら encode(decoded) が入力と一致することを確認。
-        // 構造 canonical の不動点性（scan は非 canonical を Ok にしない）を担保する。
+        // Brute-force 1-3 bytes and, when Ok, check that encode(decoded) equals the input.
+        // Ensures the fixed-point property of structural canonicality (scan never returns Ok for non-canonical).
         let mut buf = Vec::new();
         for a in 0u16..=255 {
             buf.clear();

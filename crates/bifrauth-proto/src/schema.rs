@@ -1,19 +1,19 @@
-//! 層B: BifrAuth メッセージのスキーマ検証とエンコード。
+//! Layer B: schema validation and encoding of BifrAuth messages.
 //!
-//! 規範は `spec/cbor-profile.md` §4（challenge.v1）/§5（response.v1）/§6（envelope.v1）。
-//! 層A（[`crate::cbor`]）で canonical と判定された `Value` に対し、キー全必須・exact/範囲を検査する。
-//! 各スキーマはキー 0..N-1 の連番 map なので、`cbor::scan_structure` が保証する「昇順・一意キー」と合わせ、
-//! 「エントリ数 == N かつ i 番目のキー == i」で余分/欠損/重複/順序違反をまとめて排除する。
+//! The normative spec is `spec/cbor-profile.md` §4 (challenge.v1) / §5 (response.v1) / §6 (envelope.v1).
+//! For a `Value` deemed canonical by layer A ([`crate::cbor`]), it checks all-keys-required and exact/range.
+//! Each schema is a map with contiguous keys 0..N-1, so combined with the "ascending, unique keys"
+//! guaranteed by `cbor::scan_structure`, "entry count == N and the i-th key == i" rules out extra/missing/duplicate/order violations at once.
 //!
-//! テキスト内容は [`TextPolicy`] が検査する: byte 長・ASCII・制御・bidi に加え、**Unicode 16.0
-//! 未割当（Cn, vendored 表）の拒否**と **NFC 正規化検査**（プロファイル §7・§7.1）。Rust/Swift の
-//! 受理集合一致は vendored の Cn 表と共有ベクタで担保する。
+//! Text content is checked by [`TextPolicy`]: byte length, ASCII, control, bidi, plus **rejection of
+//! Unicode 16.0 unassigned (Cn, vendored table)** and an **NFC normalization check** (profile §7/§7.1).
+//! Rust/Swift acceptance-set agreement is ensured by the vendored Cn table and shared vectors.
 
 use crate::cbor::{self, Limits, Value};
 use crate::unicode_cn;
 use unicode_normalization::UnicodeNormalization;
 
-/// 初版のプロトコルバージョン（プロファイル §10 の対応表）。
+/// The initial protocol version (profile §10 mapping table).
 pub const PROTOCOL_VERSION: u64 = 1;
 
 pub const MESSAGE_TYPE_CHALLENGE: &str = "bifrauth.challenge.v1";
@@ -24,49 +24,49 @@ pub const VERIFIER_SIGNATURE_ALGORITHM: &str = "Ed25519";
 const EPOCH_MAX: u64 = 253_402_300_799; // year 9999, < 2^53
 const TTL_MIN: u64 = 1;
 const TTL_MAX: u64 = 30;
-const UID_MAX: u64 = 4_294_967_294; // (uid_t)-1 = 4294967295 を拒否
+const UID_MAX: u64 = 4_294_967_294; // reject (uid_t)-1 = 4294967295
 
 const CHALLENGE_MAX_TOTAL: usize = 4096;
 const ENVELOPE_MAX_TOTAL: usize = 4608;
 const RESPONSE_MAX_TOTAL: usize = 512;
 
-// フィールド byte 上限（プロファイル §4/§5/§6）
+// Field byte limits (profile §4/§5/§6)
 const MAX_DEVICE_NAME: usize = 128;
 const MAX_USERNAME: usize = 256;
 const MAX_PAM_SERVICE: usize = 128;
 const MAX_PAM_TTY_RHOST: usize = 256;
 const MAX_REQUESTED_ACTION: usize = 256;
-const MAX_DEVICE_ID_TEXT: usize = 128; // response.iphone_device_id は 16B bstr だが将来 hint 表示用の余地
-const MAX_DER_SIGNATURE: usize = 72; // P-256 X9.62 DER の最大長
+const MAX_DEVICE_ID_TEXT: usize = 128; // response.iphone_device_id is a 16B bstr, but leave room for future hint display
+const MAX_DER_SIGNATURE: usize = 72; // maximum length of a P-256 X9.62 DER
 
-/// スキーマ検証の失敗理由。
+/// Reasons schema validation can fail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaError {
-    /// 層A（canonical）の失敗。
+    /// A layer-A (canonical) failure.
     Cbor(cbor::Error),
-    /// top-level が map でない。
+    /// The top-level value is not a map.
     NotMap,
-    /// エントリ数が期待と異なる。
+    /// The entry count differs from expected.
     WrongEntryCount { expected: usize, got: usize },
-    /// i 番目のキーが期待（= i）と異なる（余分/欠損/順序）。
+    /// The i-th key differs from expected (= i) (extra/missing/order).
     WrongKey { pos: usize, expected: u64, got: u64 },
-    /// フィールドの CBOR 型が異なる。
+    /// A field has the wrong CBOR type.
     WrongType { key: u64 },
-    /// 数値が許可範囲外。
+    /// A numeric value is out of the allowed range.
     OutOfRange { key: u64 },
-    /// byte/text の長さが規定外。
+    /// A byte/text length is out of spec.
     BadLength { key: u64 },
-    /// テキストが ASCII/制御/bidi 制約に違反。
+    /// Text violates the ASCII/control/bidi constraints.
     BadText { key: u64 },
-    /// テキストが NFC 正規化形でない（プロファイル §7）。
+    /// Text is not in NFC normalized form (profile §7).
     NotNfc { key: u64 },
-    /// テキストが Unicode 16.0 で未割当（Cn）の code point を含む（プロファイル §7）。
+    /// Text contains a code point that is unassigned (Cn) in Unicode 16.0 (profile §7).
     Unassigned { key: u64 },
-    /// `message_type` が一致しない。
+    /// `message_type` does not match.
     MessageTypeMismatch,
-    /// 固定文字列フィールド（algorithm 等）が一致しない。
+    /// A fixed-string field (e.g. algorithm) does not match.
     FixedStringMismatch { key: u64 },
-    /// TTL（expires - issued）が範囲外、または issued >= expires。
+    /// The TTL (expires - issued) is out of range, or issued >= expires.
     TtlOutOfRange,
 }
 
@@ -76,17 +76,17 @@ impl From<cbor::Error> for SchemaError {
     }
 }
 
-/// テキストフィールドの内容ポリシー（プロファイル §7・§7.1）。
+/// Content policy for text fields (profile §7/§7.1).
 ///
-/// 検査項目: byte 長範囲、ASCII 限定（指定時）、C0（U+0000..U+001F, NUL 含む）/ C1
-/// （U+0080..U+009F）制御と Bidi_Control code point の拒否、**Unicode 16.0 未割当（Cn）の拒否**、
-/// **NFC 正規化形であることの検査**。
+/// Checks: byte-length range, ASCII-only (when specified), rejection of C0 (U+0000..U+001F, incl. NUL) /
+/// C1 (U+0080..U+009F) control and Bidi_Control code points, **rejection of Unicode 16.0 unassigned (Cn)**,
+/// and a **check that the text is in NFC normalized form**.
 ///
-/// NFC/未割当は Rust↔Swift で受理集合を一致させる必要がある（§7.1）:
-/// - 未割当判定は vendored の Unicode 16.0 Cn 表（[`unicode_cn`]）で行い、ライブラリのカテゴリ表に
-///   依存しない。**先に 16.0 未割当を拒否**してから NFC を見る。
-/// - NFC 判定は最新安定版 `unicode-normalization` の NFC 変換をスカラー列比較する（`==` は使わない）。
-///   16.0 割当済みに gate 済みなので、正規化安定性により新しい Unicode 版でも結果は 16.0 と一致する。
+/// NFC/unassigned must agree between Rust and Swift on the acceptance set (§7.1):
+/// - The unassigned check uses the vendored Unicode 16.0 Cn table ([`unicode_cn`]), not a library
+///   category table. **Reject 16.0-unassigned first**, then check NFC.
+/// - The NFC check compares the NFC transform of the latest-stable `unicode-normalization` scalar-by-scalar
+///   (not via `==`). Since we have gated to 16.0-assigned, normalization stability makes the result match 16.0 even on newer Unicode versions.
 struct TextPolicy;
 
 // Bidi_Control=Yes（Unicode 16.0）: ALM, LRM, RLM, LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI
@@ -97,26 +97,26 @@ const BIDI_CONTROL: [u32; 12] = [
 impl TextPolicy {
     fn forbidden_char(ch: char) -> bool {
         let c = ch as u32;
-        // C0（NUL 含む）と C1 制御。
+        // C0 (incl. NUL) and C1 control.
         if c <= 0x1f || (0x80..=0x9f).contains(&c) {
             return true;
         }
         BIDI_CONTROL.contains(&c)
     }
 
-    /// 入力が既に NFC 形かを判定する。呼び出し前に未割当（16.0 Cn）を拒否済みであること
-    /// （正規化安定性の前提）。
+    /// Determine whether the input is already in NFC form. Unassigned (16.0 Cn) must be rejected before
+    /// calling this (the normalization-stability precondition).
     ///
-    /// NFC 変換結果の code point 列と入力の code point 列を iterator で比較する。
-    /// Rust の `str`/`String` の `==` は**バイト（コードユニット）厳密**なので `s == s.nfc().collect::<String>()`
-    /// でも判定は正しいが、中間 String を確保しないため iterator の `eq` を使う（割当回避）。
-    /// なお Swift 側は `String ==` が**正準等価**のため使えず、`unicodeScalars`/`utf8` の生列比較が必須
-    /// （プロファイル §7.1）。この差異は言語ごとに理由が異なる点に注意。
+    /// Compare the code-point sequence of the NFC transform with the input's, using an iterator.
+    /// Rust's `str`/`String` `==` is **byte (code-unit) exact**, so `s == s.nfc().collect::<String>()` would
+    /// also be correct, but we use the iterator `eq` to avoid allocating the intermediate String.
+    /// Note that on the Swift side `String ==` is **canonical equivalence** and cannot be used; a raw
+    /// `unicodeScalars`/`utf8` sequence comparison is required (profile §7.1). Note the reasons differ per language.
     fn is_nfc(s: &str) -> bool {
         s.nfc().eq(s.chars())
     }
 
-    /// byte 長 `min..=max`、必要なら ASCII 限定、制御・bidi・未割当・非 NFC を検査する。
+    /// Check byte length `min..=max`, optionally ASCII-only, and control/bidi/unassigned/non-NFC.
     fn check(
         s: &str,
         key: u64,
@@ -135,7 +135,7 @@ impl TextPolicy {
             if Self::forbidden_char(ch) {
                 return Err(SchemaError::BadText { key });
             }
-            // 未割当（16.0 Cn）は NFC 判定より先に拒否する（安定性の前提を満たすため）。
+            // Reject unassigned (16.0 Cn) before the NFC check (to satisfy the stability precondition).
             if unicode_cn::is_cn(ch as u32) {
                 return Err(SchemaError::Unassigned { key });
             }
@@ -147,7 +147,7 @@ impl TextPolicy {
     }
 }
 
-// ---- Value からの型付き取り出し ----
+// ---- Typed extraction from Value ----
 
 fn take_uint(v: &Value, key: u64) -> Result<u64, SchemaError> {
     match v {
@@ -181,7 +181,7 @@ fn take_text_or_null(v: &Value, key: u64) -> Result<Option<&str>, SchemaError> {
     }
 }
 
-/// map として連番キー 0..N-1 を厳密に検査し、値スライスを返す。
+/// Strictly check the map has contiguous keys 0..N-1 and return the value slice.
 fn map_entries(v: &Value, n: usize) -> Result<&[(u64, Value)], SchemaError> {
     let Value::Map(entries) = v else {
         return Err(SchemaError::NotMap);
@@ -217,7 +217,7 @@ fn expect_fixed(v: &Value, key: u64, expected: &str) -> Result<(), SchemaError> 
 
 // ---- challenge.v1 ----
 
-/// `bifrauth.challenge.v1`（プロファイル §4）。
+/// `bifrauth.challenge.v1` (profile §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Challenge {
     pub protocol_version: u64,
@@ -248,13 +248,13 @@ fn challenge_limits() -> Limits {
 }
 
 impl Challenge {
-    /// 全フィールドの層B 制約を検査する（decode 後と encode 前の両方で必ず呼ぶ）。
-    /// **暗黙の正規化はしない** — 違反は Err にする。
+    /// Check the layer-B constraints on all fields (always called after decode and before encode).
+    /// **No implicit normalization** — a violation is an Err.
     pub fn validate(&self) -> Result<(), SchemaError> {
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(SchemaError::OutOfRange { key: 1 });
         }
-        // exact byte 長は型（[u8; N]）が保証する。
+        // Exact byte lengths are guaranteed by the types ([u8; N]).
         TextPolicy::check(&self.linux_device_name, 6, 1, MAX_DEVICE_NAME, false)?;
         if self.target_uid as u64 > UID_MAX {
             return Err(SchemaError::OutOfRange { key: 7 });
@@ -290,12 +290,12 @@ impl Challenge {
         Ok(())
     }
 
-    /// canonical バイト列を検証して復元する（層A + 型抽出 + 層B `validate`）。
+    /// Validate and reconstruct from canonical bytes (layer A + typed extraction + layer-B `validate`).
     pub fn decode(bytes: &[u8]) -> Result<Challenge, SchemaError> {
         let v = cbor::scan_structure(bytes, challenge_limits())?;
         let e = map_entries(&v, 16)?;
 
-        // 型・exact byte 長・固定文字列の抽出（構造）。
+        // Extract types, exact byte lengths, and fixed strings (structure).
         expect_fixed(&e[0].1, 0, MESSAGE_TYPE_CHALLENGE)?;
         let protocol_version = take_uint(&e[1].1, 1)?;
         let request_id = take_bytes_exact::<16>(&e[2].1, 2)?;
@@ -303,7 +303,7 @@ impl Challenge {
         let verifier_key_id = take_bytes_exact::<32>(&e[4].1, 4)?;
         let linux_device_id = take_bytes_exact::<16>(&e[5].1, 5)?;
         let linux_device_name = take_text(&e[6].1, 6)?.to_owned();
-        // uid は u32 へ格納するため、範囲外はここで拒否してから構築する（validate でも再検査）。
+        // uid is stored as u32, so reject out-of-range here before constructing (validate rechecks it too).
         let uid = take_uint(&e[7].1, 7)?;
         if uid > UID_MAX {
             return Err(SchemaError::OutOfRange { key: 7 });
@@ -338,7 +338,7 @@ impl Challenge {
         Ok(c)
     }
 
-    /// 検証してから canonical バイト列へエンコードする。不正な内容は Err（正規化しない）。
+    /// Validate, then encode to canonical bytes. Invalid content is an Err (no normalization).
     pub fn encode(&self) -> Result<Vec<u8>, SchemaError> {
         self.validate()?;
         let entries = vec![
@@ -372,7 +372,7 @@ fn opt_text(o: &Option<String>) -> Value {
 
 // ---- envelope.v1 ----
 
-/// `bifrauth.envelope.v1`（プロファイル §6）。inner の canonical_challenge は生バイト列で保持する。
+/// `bifrauth.envelope.v1` (profile §6). The inner canonical_challenge is held as raw bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
     pub canonical_challenge: Vec<u8>,
@@ -390,8 +390,8 @@ fn envelope_limits() -> Limits {
 }
 
 impl Envelope {
-    /// 層B 制約: canonical_challenge は 1..=CHALLENGE_MAX_TOTAL バイト。
-    /// verifier_signature の長さは型（[u8; 64]）が保証する。
+    /// Layer-B constraints: canonical_challenge is 1..=CHALLENGE_MAX_TOTAL bytes.
+    /// The verifier_signature length is guaranteed by the type ([u8; 64]).
     pub fn validate(&self) -> Result<(), SchemaError> {
         let len = self.canonical_challenge.len();
         if len == 0 || len > CHALLENGE_MAX_TOTAL {
@@ -400,14 +400,14 @@ impl Envelope {
         Ok(())
     }
 
-    /// envelope を復元する。
+    /// Reconstruct the envelope.
     ///
-    /// **重要（プロファイル §6・§8）:** 返る [`Envelope::canonical_challenge`] は**未検証の生バイト列**。
-    /// これは「Ed25519 署名を生バイト列に対して検証する」設計のため意図的にそのまま保持する。
-    /// 呼び出し側は必ず次を行う: (1) `verifier_signature` を登録済み verifier 公開鍵で
-    /// `canonical_challenge` の**生バイト列**に対し検証 → (2) **同じバイト列**を
-    /// [`Challenge::decode`] に通して層A/層B を検査 → (3) 保留中の request 状態（request_id/nonce/
-    /// expiry 等）と照合。**decode しただけの `Envelope` を検証済み Challenge と誤認しないこと。**
+    /// **Important (profile §6/§8):** the returned [`Envelope::canonical_challenge`] is **unvalidated raw
+    /// bytes**. This is kept as-is deliberately, because the design verifies the Ed25519 signature over the
+    /// raw bytes. The caller must: (1) verify `verifier_signature` against the **raw bytes** of
+    /// `canonical_challenge` with the registered verifier public key -> (2) run layer-A/layer-B checks on the
+    /// **same bytes** via [`Challenge::decode`] -> (3) match the pending request state (request_id/nonce/
+    /// expiry, etc.). **Do not mistake a merely decoded `Envelope` for a validated Challenge.**
     pub fn decode(bytes: &[u8]) -> Result<Envelope, SchemaError> {
         let v = cbor::scan_structure(bytes, envelope_limits())?;
         let e = map_entries(&v, 3)?;
@@ -425,7 +425,7 @@ impl Envelope {
         Ok(env)
     }
 
-    /// 検証してから canonical バイト列へエンコードする。
+    /// Validate, then encode to canonical bytes.
     pub fn encode(&self) -> Result<Vec<u8>, SchemaError> {
         self.validate()?;
         let entries = vec![
@@ -439,32 +439,32 @@ impl Envelope {
 
 // ---- response.v1 ----
 
-/// `bifrauth.response.v1`（プロファイル §5）。
+/// `bifrauth.response.v1` (profile §5).
 ///
-/// 注意: `signed_payload_hash` は**認証入力として信用しない**。authd は保留 challenge から
-/// 再計算し、不一致は malformed 扱い。署名検証は保存済み canonical bytes に対して行う（プロファイル §5）。
+/// Note: `signed_payload_hash` is **not trusted as an authentication input**. authd recomputes it from the
+/// pending challenge and treats a mismatch as malformed. Signature verification is done against the stored canonical bytes (profile §5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
     pub protocol_version: u64,
     pub request_id: [u8; 16],
     pub iphone_device_id: [u8; 16],
     pub signed_payload_hash: [u8; 32],
-    pub signature: Vec<u8>, // X9.62 DER, 1..=72B（strict DER 検査は crypto 層）
+    pub signature: Vec<u8>, // X9.62 DER, 1..=72B (strict DER checks live in the crypto layer)
 }
 
 fn response_limits() -> Limits {
     Limits {
         max_total: RESPONSE_MAX_TOTAL,
         max_depth: 1,
-        max_bytes: 72, // signature DER 上限
+        max_bytes: 72, // signature DER upper bound
         max_text: MAX_DEVICE_ID_TEXT.max(SIGNATURE_ALGORITHM.len()),
         max_map_entries: 7,
     }
 }
 
 impl Response {
-    /// 層B 制約: protocol_version==1、signature は 1..=72B（strict DER は crypto 層）。
-    /// exact byte 長フィールドは型が保証する。
+    /// Layer-B constraints: protocol_version==1; signature is 1..=72B (strict DER lives in the crypto layer).
+    /// Exact-byte-length fields are guaranteed by the types.
     pub fn validate(&self) -> Result<(), SchemaError> {
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(SchemaError::OutOfRange { key: 1 });
@@ -500,7 +500,7 @@ impl Response {
         Ok(r)
     }
 
-    /// 検証してから canonical バイト列へエンコードする。
+    /// Validate, then encode to canonical bytes.
     pub fn encode(&self) -> Result<Vec<u8>, SchemaError> {
         self.validate()?;
         let entries = vec![
@@ -549,7 +549,7 @@ mod tests {
         assert_eq!(c, back);
     }
 
-    // encode は self を検証するので、不正な struct は encode() 時点で Err（正規化しない）。
+    // encode validates self, so an invalid struct is an Err at encode() time (no normalization).
     #[test]
     fn challenge_encode_rejects_bad_uid() {
         let mut c = sample_challenge();
@@ -569,9 +569,9 @@ mod tests {
     #[test]
     fn challenge_encode_rejects_bad_confirmation_code() {
         let mut c = sample_challenge();
-        c.confirmation_code = "12345".into(); // 5 桁
+        c.confirmation_code = "12345".into(); // 5 digits
         assert_eq!(c.encode(), Err(SchemaError::BadText { key: 15 }));
-        c.confirmation_code = "12a456".into(); // 非数字
+        c.confirmation_code = "12a456".into(); // non-digit
         assert_eq!(c.encode(), Err(SchemaError::BadText { key: 15 }));
     }
 
@@ -594,7 +594,7 @@ mod tests {
 
     #[test]
     fn challenge_encode_rejects_non_nfc() {
-        // "é" の分解形（e + U+0301 結合アクセント）は非 NFC。
+        // The decomposed form of "é" (e + U+0301 combining acute) is non-NFC.
         let mut c = sample_challenge();
         c.target_username = "e\u{0301}".into();
         assert_eq!(c.encode(), Err(SchemaError::NotNfc { key: 8 }));
@@ -602,7 +602,7 @@ mod tests {
 
     #[test]
     fn challenge_accepts_nfc_composed() {
-        // 合成形 "é"（U+00E9）は NFC。roundtrip できる。
+        // The composed "é" (U+00E9) is NFC and can round-trip.
         let mut c = sample_challenge();
         c.target_username = "caf\u{00E9}".into();
         let back = Challenge::decode(&c.encode().unwrap()).unwrap();
@@ -611,14 +611,14 @@ mod tests {
 
     #[test]
     fn challenge_encode_rejects_unassigned() {
-        // U+0378 は Unicode 16.0 で未割当（Cn）。
+        // U+0378 is unassigned (Cn) in Unicode 16.0.
         let mut c = sample_challenge();
         c.linux_device_name = "ws\u{0378}".into();
         assert_eq!(c.encode(), Err(SchemaError::Unassigned { key: 6 }));
     }
 
-    /// cross-language ベクタ（`spec/vectors/text_policy.tsv`）に対し、Rust をoracleとして
-    /// TextPolicy の結果が期待カテゴリと一致することを検査する。Swift は同じ fixture を読む。
+    /// Against the cross-language vectors (`spec/vectors/text_policy.tsv`), check that TextPolicy's result
+    /// matches the expected category, with Rust as the oracle. Swift reads the same fixture.
     #[test]
     fn text_policy_vectors_conformance() {
         const TSV: &str = include_str!(concat!(
@@ -638,7 +638,7 @@ mod tests {
                 .split_whitespace()
                 .map(|h| char::from_u32(u32::from_str_radix(h, 16).unwrap()).unwrap())
                 .collect();
-            // 長さ制約は別枠なので min=0/max 大で無効化し、テキスト内容ポリシーだけを見る。
+            // Length constraints are separate, so disable them with min=0/large max and look only at the text content policy.
             let got = match TextPolicy::check(&s, 0, 0, 8192, false) {
                 Ok(()) => "ok",
                 Err(SchemaError::NotNfc { .. }) => "not_nfc",
@@ -660,8 +660,8 @@ mod tests {
             .collect()
     }
 
-    /// golden メッセージ（`spec/vectors/messages_golden.tsv`）が decode でき、かつ
-    /// 再 encode すると同一 canonical バイト列に戻ることを検査する（両方向・安定性）。
+    /// Check that the golden messages (`spec/vectors/messages_golden.tsv`) decode and, when re-encoded,
+    /// return the same canonical bytes (both directions / stability).
     #[test]
     fn messages_golden_conformance() {
         const TSV: &str = include_str!(concat!(
@@ -708,7 +708,7 @@ mod tests {
 
     #[test]
     fn challenge_rejects_wrong_message_type() {
-        // key0 を別文字列にした map を直接構築。
+        // Directly build a map with a different string for key0.
         let mut entries: Vec<(u64, Value)> = vec![(0, Value::Text("bifrauth.challenge.v2".into()))];
         for k in 1..16u64 {
             entries.push((k, Value::Uint(0)));
@@ -722,7 +722,7 @@ mod tests {
 
     #[test]
     fn challenge_rejects_missing_key() {
-        // 15 エントリ（1 個欠損）。
+        // 15 entries (one missing).
         let mut entries: Vec<(u64, Value)> = vec![(0, Value::Text(MESSAGE_TYPE_CHALLENGE.into()))];
         for k in 1..15u64 {
             entries.push((k, Value::Uint(0)));
@@ -763,7 +763,7 @@ mod tests {
             let entries = vec![
                 (0u64, Value::Bytes(vec![1, 2, 3])),
                 (1, Value::Text(VERIFIER_SIGNATURE_ALGORITHM.into())),
-                (2, Value::Bytes(vec![0u8; 63])), // 64 でない
+                (2, Value::Bytes(vec![0u8; 63])), // not 64
             ];
             cbor::encode(&Value::Map(entries))
         };
@@ -780,7 +780,7 @@ mod tests {
             request_id: [1u8; 16],
             iphone_device_id: [9u8; 16],
             signed_payload_hash: [8u8; 32],
-            signature: vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01], // 形式は crypto 層で検査
+            signature: vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01], // format is checked in the crypto layer
         };
         let back = Response::decode(&r.encode().unwrap()).unwrap();
         assert_eq!(r, back);
@@ -812,7 +812,7 @@ mod tests {
 
     #[test]
     fn response_rejects_oversize_signature() {
-        // 73B 署名は層A の max_bytes=72 で先に弾かれる（TooLarge）。どちらも fail closed。
+        // A 73B signature is rejected first by layer A's max_bytes=72 (TooLarge). Both fail closed.
         let bytes = cbor::encode(&Value::Map(response_entries(vec![0u8; 73])));
         assert_eq!(
             Response::decode(&bytes),
@@ -822,7 +822,7 @@ mod tests {
 
     #[test]
     fn response_rejects_empty_signature() {
-        // 空署名は層B で BadLength。
+        // An empty signature is BadLength in layer B.
         let bytes = cbor::encode(&Value::Map(response_entries(vec![])));
         assert_eq!(
             Response::decode(&bytes),

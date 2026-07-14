@@ -1,6 +1,6 @@
-//! bifrauth-crypto × bifrauth-proto の統合テスト。
-//! verifier が canonical challenge を Ed25519 署名し、iPhone(mock) が同じ canonical bytes を
-//! P-256 署名する、というプロトコルの署名往復を canonical バイト列で通す（設計 §9）。
+//! Integration test for bifrauth-crypto x bifrauth-proto.
+//! Exercises the protocol's signing round-trip over canonical bytes: the verifier Ed25519-signs the
+//! canonical challenge and the iPhone (mock) P-256-signs the same canonical bytes (design §9).
 
 use bifrauth_crypto::{ed25519, p256_ecdsa, sha256};
 use bifrauth_proto::Challenge;
@@ -29,13 +29,13 @@ fn sample_challenge() -> Challenge {
 fn verifier_ed25519_signs_canonical_challenge() {
     let canonical = sample_challenge().encode().expect("encode");
 
-    // verifier が canonical_challenge の生バイト列へ Ed25519 署名（envelope の 64B 署名）。
+    // The verifier Ed25519-signs the raw canonical_challenge bytes (the envelope's 64B signature).
     let sk = ed25519::signing_key(&[0x03; 32]);
     let pk = ed25519::public_key(&sk);
     let sig = ed25519::sign(&sk, &canonical);
     assert!(ed25519::verify(&pk, &canonical, &sig).is_ok());
 
-    // 1 バイトでも変われば検証は失敗する（バイト列一致が本質）。
+    // Changing even one byte fails verification (exact byte match is the point).
     let mut tampered = canonical.clone();
     tampered[0] ^= 0x01;
     assert!(ed25519::verify(&pk, &tampered, &sig).is_err());
@@ -48,16 +48,16 @@ fn iphone_p256_signs_canonical_challenge_and_hash_matches() {
 
     let canonical = sample_challenge().encode().expect("encode");
 
-    // iPhone(mock) の Secure Enclave 相当鍵で canonical bytes を P-256 署名。
+    // The iPhone (mock) P-256-signs the canonical bytes with its Secure-Enclave-equivalent key.
     let device_sk = SigningKey::from_slice(&[0x55; 32]).unwrap();
     let device_pk_sec1 = device_sk.verifying_key().to_sec1_bytes();
     let sig: Signature = device_sk.sign(&canonical);
     assert!(p256_ecdsa::verify(&device_pk_sec1, &canonical, sig.to_der().as_bytes()).is_ok());
 
-    // signed_payload_hash は verifier が保留 canonical bytes から再計算した値と一致する。
+    // signed_payload_hash equals the value the verifier recomputes from the pending canonical bytes.
     let expected = sha256(&canonical);
     assert_eq!(expected.len(), 32);
-    // （応答が別の challenge の hash を送ってきても、verifier 側の再計算は canonical に紐づく）
+    // (Even if a response carries another challenge's hash, the verifier's recomputation is bound to canonical.)
     let other = {
         let mut c = sample_challenge();
         c.nonce = [0x99; 16];

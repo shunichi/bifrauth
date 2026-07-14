@@ -1,4 +1,4 @@
-# SHA pin した GitHub Actions を自動更新する（codex レビュー推奨）。
+# Keep the SHA-pinned GitHub Actions up to date automatically (recommended by codex review).
 version: 2
 updates:
   - package-ecosystem: github-actions

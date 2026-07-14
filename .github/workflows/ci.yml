@@ -4,12 +4,12 @@ on:
   push:
   pull_request:
 
-# GITHUB_TOKEN を最小権限に固定する。pull_request は fork のコード（build.rs/テスト）を
-# 実行しうるため、read のみを与える（secret も使わない）。
+# Pin GITHUB_TOKEN to the least privilege. pull_request may run fork code (build.rs/tests),
+# so grant read only (and use no secrets).
 permissions:
   contents: read
 
-# 直近の push だけを残して古い実行はキャンセルする。
+# Keep only the latest push; cancel older in-flight runs.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -23,14 +23,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      # サードパーティ action は 40 桁 commit SHA に pin する（.github/dependabot.yml で更新）。
+      # Pin third-party actions to a 40-char commit SHA (updated via .github/dependabot.yml).
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          # GITHUB_TOKEN を git config へ残さない。後続で走る untrusted PR の
-          # build.rs/テストが token を読み出して外部送信するのを防ぐ（CI に後続 push 操作は無い）。
+          # Do not leave GITHUB_TOKEN in the git config. Prevents a subsequent untrusted PR's
+          # build.rs/tests from reading and exfiltrating the token (this CI does no later push).
           persist-credentials: false
 
-      # rust-toolchain.toml（1.97.0 + rustfmt/clippy）が SSOT。version を workflow に二重記載しない。
+      # rust-toolchain.toml (1.97.0 + rustfmt/clippy) is the single source of truth; do not duplicate the version here.
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - name: Versions
@@ -38,9 +38,9 @@ jobs:
           rustc --version
           cargo --version
 
-      # Cargo.lock を CI 契約として強制する（--locked）。crate は cache 未使用なので毎回
-      # registry から取得し、Cargo.lock + checksum で固定される（vendored なのは Unicode 表と
-      # spec/vectors のみ）。
+      # Enforce Cargo.lock as a CI contract (--locked). Crates are fetched from the registry every
+      # time (no cache) and pinned by Cargo.lock + checksums (only the Unicode table and spec/vectors
+      # are vendored).
       - name: Format check
         run: cargo fmt --all --check
 

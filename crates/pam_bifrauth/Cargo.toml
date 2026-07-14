@@ -5,9 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# PAM モジュールは cdylib（pam_bifrauth.so）としてビルドする。
-# 実装計画 §4.6: FFI 境界で catch_unwind し、panic を PAM 呼び出し元へ伝播させない
-# （panic = "unwind" 既定を維持し abort にしない）。テスト用に rlib も出す。
+# The PAM module builds as a cdylib (pam_bifrauth.so).
+# Implementation plan §4.6: catch_unwind at the FFI boundary so panics never propagate to the PAM caller
+# (keep the default panic = "unwind"; do not use abort). Also emit an rlib for tests.
 [lib]
 crate-type = ["cdylib", "rlib"]
 

@@ -1,5 +1,5 @@
-# ツールチェインを固定して実装間の再現性を確保する（実装計画 P0）。
-# 最新安定版を使う方針（CLAUDE.md）。更新時はこの版と Cargo.toml の rust-version を揃える。
+# Pin the toolchain for reproducibility across implementations (implementation plan P0).
+# Latest-stable policy (CLAUDE.md). When bumping, keep this in sync with Cargo.toml's rust-version.
 [toolchain]
 channel = "1.97.0"
 components = ["rustfmt", "clippy"]

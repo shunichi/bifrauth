@@ -11,3 +11,6 @@ rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 mock-iphone = { path = "../mock-iphone" }
+# Enable bifrauthd's `testing` feature for our tests so Registry::open_with_owner is available
+# (unprivileged tests own a temp registry). This does not affect the production binary build.
+bifrauthd = { version = "0.1.0", path = "../bifrauthd", features = ["testing"] }

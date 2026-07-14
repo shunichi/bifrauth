@@ -1,25 +1,27 @@
 //! End-to-end authentication over the real root socket, with the device registry as the source of truth
 //! (design §23-9,10; task 0009 D7).
 //!
-//! Wires the production accept loop [`bifrauthd::serve::serve`] on a real `UnixListener`, injects a
+//! Wires the production accept loop [`crate::serve::serve`] on a real `UnixListener`, injects a
 //! [`bifrauth_ipc::Transport`] backed by [`mock_iphone::MockIphone`] (the stand-in responder), and drives
 //! a client through `AuthRequest → ConfirmationCode → DisplayAck → Outcome`. The verifier's device set is
-//! loaded from an on-disk [`bifrauthd::registry::Registry`], so this exercises the full 0009 path:
+//! loaded from an on-disk [`crate::registry::Registry`], exercising the full 0009 path:
 //!
 //! - a registered device completes the round trip with `Success`;
 //! - after `revoke` + an atomic snapshot reload, the same device is `Denied`.
 //!
 //! The finer "a response whose challenge was issued while the device was still active must be denied once
 //! the registry is swapped to a revoked snapshot" case is proven deterministically at the verifier level
-//! in `lib.rs::tests::pending_response_crossing_a_revoke_boundary_is_denied` (it needs to interleave
-//! issue/replace/verify precisely, which the synchronous socket flow cannot express).
+//! in `crate::tests::pending_response_crossing_a_revoke_boundary_is_denied`.
+//!
+//! This is a `#[cfg(test)]` module (not a `tests/` integration test) so it can use the cfg(test)-only
+//! `Registry::open_with_owner` to own a temp registry while running unprivileged.
 
+use crate::Verifier;
+use crate::registry::Registry;
+use crate::serve::{Shared, serve};
+use crate::session::{Policy, ResolvedIdentity, UserResolver};
 use bifrauth_ipc::wire::{AuthRequest, ConfirmationCode, DisplayAck, Outcome, OutcomeCode};
 use bifrauth_ipc::{Clock, Deadline, Transport, TransportError, frame};
-use bifrauthd::Verifier;
-use bifrauthd::registry::Registry;
-use bifrauthd::serve::{Shared, serve};
-use bifrauthd::session::{Policy, ResolvedIdentity, UserResolver};
 use mock_iphone::MockIphone;
 use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -35,7 +37,6 @@ const LINUX_DEV: [u8; 16] = [0x44; 16];
 const UID: u32 = 4242;
 const SERVICE: &str = "bifrauth-login";
 
-// A fixed clock so the pending challenge never expires mid-test regardless of real elapsed time.
 #[derive(Clone, Copy)]
 struct FixedClock(u64);
 impl Clock for FixedClock {
@@ -44,7 +45,6 @@ impl Clock for FixedClock {
     }
 }
 
-// The transport port backed by the software mock iPhone (the responder).
 struct IphoneTransport {
     ph: MockIphone,
 }
@@ -88,8 +88,6 @@ fn resolver() -> MapResolver {
     m.insert("alice".to_string(), UID);
     MapResolver(m)
 }
-
-// ---- a temp registry the test user owns ----
 
 struct TempBase {
     path: PathBuf,

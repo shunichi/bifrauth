@@ -36,6 +36,7 @@
 use crate::{DeviceSnapshot, SnapshotError};
 use bifrauth_crypto as crypto;
 use bifrauth_proto::cbor::{self, Value};
+use bifrauth_proto::text;
 use rustix::fs::{
     AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags, flock, fstat, mkdirat,
     openat, renameat_with, unlinkat,
@@ -121,6 +122,13 @@ pub enum RegistryError {
     /// A path-safety invariant was violated (symlink, wrong owner/mode, unexpected hardlink, non-regular,
     /// unknown directory entry). Fail closed. Carries a path hint and reason.
     Unsafe { path: String, reason: String },
+    /// The change was published (the rename succeeded) but the subsequent directory `fsync` failed, so its
+    /// durability across a crash is uncertain. The operation itself took effect — a caller should verify
+    /// with `list` rather than retry (a retry hits AlreadyRegistered/AlreadyRevoked anyway).
+    DurabilityUncertain {
+        path: String,
+        source: std::io::Error,
+    },
     /// The OS randomness source failed while generating a temp name.
     Rng,
     /// An unexpected I/O error. Carries a path hint.
@@ -144,6 +152,10 @@ impl std::fmt::Display for RegistryError {
             RegistryError::Unsafe { path, reason } => {
                 write!(f, "unsafe registry path {path}: {reason}")
             }
+            RegistryError::DurabilityUncertain { path, source } => write!(
+                f,
+                "change applied but durability uncertain (fsync {path} failed: {source}); verify with `list`"
+            ),
             RegistryError::Rng => write!(f, "randomness source failed"),
             RegistryError::Io { path, source } => write!(f, "I/O error on {path}: {source}"),
         }
@@ -154,6 +166,7 @@ impl std::error::Error for RegistryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             RegistryError::Io { source, .. } => Some(source),
+            RegistryError::DurabilityUncertain { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -178,25 +191,29 @@ pub struct Registry {
 
 impl Registry {
     /// Open (creating if absent) the production registry rooted at `base_path`, requiring root ownership
-    /// (uid == 0 && gid == 0). This is the only constructor callers outside tests should use; ownership is
-    /// fixed, not caller-supplied.
+    /// (uid == 0 && gid == 0). Ownership is fixed here, not caller-supplied, so a production caller cannot
+    /// weaken the owner check.
     pub fn open(base_path: &Path) -> Result<Self, RegistryError> {
-        Self::open_with_owner(base_path, 0, 0)
+        Self::open_inner(base_path, 0, 0)
     }
 
-    /// Open (creating if absent) a registry rooted at `base_path`, requiring the given owner uid/gid.
-    ///
-    /// The owner injection exists so unprivileged tests can still exercise the symlink/mode/traversal
-    /// checks against a temp directory they own. Production must use [`Registry::open`] (owner 0/0).
-    #[doc(hidden)]
+    /// Open a registry requiring an arbitrary owner uid/gid — a **testing-only** escape hatch so
+    /// unprivileged tests can exercise the symlink/mode/traversal checks against a temp directory they own.
+    /// Compiled only under `cfg(test)` or the `testing` feature, so it is absent from the production API
+    /// surface. Production must use [`Registry::open`].
+    #[cfg(any(test, feature = "testing"))]
     pub fn open_with_owner(
         base_path: &Path,
         owner_uid: u32,
         owner_gid: u32,
     ) -> Result<Self, RegistryError> {
+        Self::open_inner(base_path, owner_uid, owner_gid)
+    }
+
+    fn open_inner(base_path: &Path, owner_uid: u32, owner_gid: u32) -> Result<Self, RegistryError> {
         let base_label = base_path.display().to_string();
         let base = open_or_create_base(base_path, &base_label)?;
-        verify_dir(base.as_fd(), owner_uid, owner_gid, &base_label)?;
+        verify_dir(base.as_fd(), owner_uid, owner_gid, DIR_MODE, &base_label)?;
         Ok(Registry {
             base,
             owner_uid,
@@ -282,11 +299,10 @@ impl Registry {
     /// List one user's registrations (shared lock). Fails closed on any corrupt/unsafe entry.
     pub fn list(&self, uid: u32) -> Result<Vec<DeviceRecord>, RegistryError> {
         let _lock = self.lock(FlockOperation::LockShared)?;
-        let devices = match self.devices_dir_for_read(uid)? {
-            Some(d) => d,
-            None => return Ok(Vec::new()),
+        let Some(users) = self.open_dir_read(self.base.as_fd(), "users", "users")? else {
+            return Ok(Vec::new());
         };
-        self.read_devices_dir(devices.as_fd(), uid)
+        self.read_one_user(users.as_fd(), uid, &uid.to_string())
     }
 
     /// List every registration across all users (shared lock). Fails closed on any corrupt/unsafe entry.
@@ -354,13 +370,15 @@ impl Registry {
             }
             Err(e) => return Err(io_err(&path, e)),
         };
-        // Verify the lock inode before trusting it: regular, expected owner, no group/world write,
-        // exactly one link.
-        verify_regular(fd.as_fd(), self.owner_uid, self.owner_gid, &path)?;
+        // Only an inode we just created is normalized (fchmod to the exact mode, then made durable) — and
+        // that happens *before* verification. A pre-existing inode is never chmod'd before it is trusted:
+        // it must already be exactly the expected owner/mode/nlink or verification fails closed.
         if created {
-            // Fix mode exactly and make the new lock inode durable before anyone relies on it.
             rustix::fs::fchmod(fd.as_fd(), Mode::from_raw_mode(LOCK_MODE))
                 .map_err(|e| io_err(&path, e))?;
+        }
+        verify_regular(fd.as_fd(), self.owner_uid, self.owner_gid, LOCK_MODE, &path)?;
+        if created {
             rustix::fs::fsync(fd.as_fd()).map_err(|e| io_err(&path, e))?;
             rustix::fs::fsync(self.base.as_fd()).map_err(|e| io_err(&self.base_label, e))?;
         }
@@ -401,15 +419,19 @@ impl Registry {
             Mode::empty(),
         ) {
             Ok(fd) => {
-                verify_dir(fd.as_fd(), self.owner_uid, self.owner_gid, label)?;
+                verify_dir(fd.as_fd(), self.owner_uid, self.owner_gid, DIR_MODE, label)?;
                 Ok(fd)
             }
             Err(Errno::NOENT) => {
-                match mkdirat(parent, name, Mode::from_raw_mode(DIR_MODE)) {
-                    Ok(()) | Err(Errno::EXIST) => {}
+                // Distinguish "we created it" (mkdirat Ok) from "it appeared meanwhile" (EEXIST): only an
+                // inode we created is fchmod'd, and only before verification. A raced-in inode is verified
+                // as-is and fails closed if it is not exactly the expected directory.
+                let created = match mkdirat(parent, name, Mode::from_raw_mode(DIR_MODE)) {
+                    Ok(()) => true,
+                    Err(Errno::EXIST) => false,
                     Err(e) => return Err(io_err(label, e)),
-                }
-                // Reopen with O_NOFOLLOW: if a symlink was raced into place, this fails ELOOP.
+                };
+                // Reopen with O_NOFOLLOW: if a symlink was raced into place, this fails ELOOP/ENOTDIR.
                 let fd = openat(
                     parent,
                     name,
@@ -417,9 +439,11 @@ impl Registry {
                     Mode::empty(),
                 )
                 .map_err(|e| dir_open_err(label, e))?;
-                rustix::fs::fchmod(fd.as_fd(), Mode::from_raw_mode(DIR_MODE))
-                    .map_err(|e| io_err(label, e))?;
-                verify_dir(fd.as_fd(), self.owner_uid, self.owner_gid, label)?;
+                if created {
+                    rustix::fs::fchmod(fd.as_fd(), Mode::from_raw_mode(DIR_MODE))
+                        .map_err(|e| io_err(label, e))?;
+                }
+                verify_dir(fd.as_fd(), self.owner_uid, self.owner_gid, DIR_MODE, label)?;
                 Ok(fd)
             }
             Err(e) => Err(dir_open_err(label, e)),
@@ -439,7 +463,7 @@ impl Registry {
             Mode::empty(),
         ) {
             Ok(fd) => {
-                verify_dir(fd.as_fd(), self.owner_uid, self.owner_gid, label)?;
+                verify_dir(fd.as_fd(), self.owner_uid, self.owner_gid, DIR_MODE, label)?;
                 Ok(Some(fd))
             }
             Err(Errno::NOENT) => Ok(None),
@@ -469,38 +493,20 @@ impl Registry {
             }
             Err(e) => return Err(io_err(name, e)),
         };
+        // Regular file, expected owner, exact 0640, single link (no surprise hardlink).
+        verify_regular(fd.as_fd(), self.owner_uid, self.owner_gid, FILE_MODE, name)?;
         let st = fstat(fd.as_fd()).map_err(|e| io_err(name, e))?;
-        if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
-            return Err(RegistryError::Unsafe {
-                path: name.to_string(),
-                reason: "device file is not a regular file".to_string(),
-            });
-        }
-        if st.st_uid != self.owner_uid || st.st_gid != self.owner_gid {
-            return Err(RegistryError::Unsafe {
-                path: name.to_string(),
-                reason: "device file has an unexpected owner".to_string(),
-            });
-        }
-        if Mode::from_raw_mode(st.st_mode).bits() & 0o022 != 0 {
-            return Err(RegistryError::Unsafe {
-                path: name.to_string(),
-                reason: "device file is group/world writable".to_string(),
-            });
-        }
-        if st.st_nlink != 1 {
-            return Err(RegistryError::Unsafe {
-                path: name.to_string(),
-                reason: "device file has unexpected hard links".to_string(),
-            });
-        }
         if st.st_size < 0 || st.st_size as u64 > MAX_RECORD_FILE {
             return Err(RegistryError::Corrupt {
                 path: name.to_string(),
                 reason: "device file exceeds the size cap".to_string(),
             });
         }
-        let mut buf = Vec::with_capacity(st.st_size as usize);
+        let expected = st.st_size as u64;
+        let mut buf = Vec::with_capacity(expected as usize);
+        // Cap the read defensively; then require the byte count to equal the fstat size, so a concurrent
+        // non-cooperative writer's truncation/growth (outside our lock) fails closed rather than decoding
+        // a torn record.
         std::fs::File::from(fd)
             .take(MAX_RECORD_FILE)
             .read_to_end(&mut buf)
@@ -508,10 +514,19 @@ impl Registry {
                 path: name.to_string(),
                 source,
             })?;
+        if buf.len() as u64 != expected {
+            return Err(RegistryError::Corrupt {
+                path: name.to_string(),
+                reason: "device file size changed during read".to_string(),
+            });
+        }
         Ok(buf)
     }
 
     fn enumerate_all(&self) -> Result<Vec<DeviceRecord>, RegistryError> {
+        // The base directory is intentionally *not* enumerated: it may hold reserved siblings now
+        // (`.registry.lock`) and in future (`verifier_key`, plan D6), so only the `users/` subtree is
+        // swept. Every `users/` entry must be a canonical uid directory or the whole read fails closed.
         let Some(users) = self.open_dir_read(self.base.as_fd(), "users", "users")? else {
             return Ok(Vec::new());
         };
@@ -521,19 +536,37 @@ impl Registry {
                 path: format!("users/{}", name.to_string_lossy()),
                 reason: "non-canonical uid directory name".to_string(),
             })?;
-            let uid_name = name_str(&name)?;
-            let uid_label = format!("users/{uid_name}");
-            let Some(user_dir) = self.open_dir_read(users.as_fd(), uid_name, &uid_label)? else {
-                continue;
-            };
-            let devices_label = format!("{uid_label}/devices");
-            let Some(devices) = self.open_dir_read(user_dir.as_fd(), "devices", &devices_label)?
-            else {
-                continue;
-            };
-            out.extend(self.read_devices_dir(devices.as_fd(), uid)?);
+            out.extend(self.read_one_user(users.as_fd(), uid, name_str(&name)?)?);
         }
         Ok(out)
+    }
+
+    /// Read one `users/<uid>/devices/` subtree, rejecting anything unexpected. The `users/<uid>` directory
+    /// must contain **only** a `devices` entry (any sibling — a stray file, a `.registry.lock`, another
+    /// directory — fails closed). A missing `devices` (an empty user directory) yields no records.
+    fn read_one_user(
+        &self,
+        users: BorrowedFd<'_>,
+        uid: u32,
+        uid_name: &str,
+    ) -> Result<Vec<DeviceRecord>, RegistryError> {
+        let uid_label = format!("users/{uid_name}");
+        let Some(user_dir) = self.open_dir_read(users, uid_name, &uid_label)? else {
+            return Ok(Vec::new());
+        };
+        for name in dir_entries(user_dir.as_fd(), &uid_label)? {
+            if name.to_bytes() != b"devices" {
+                return Err(RegistryError::Unsafe {
+                    path: format!("{uid_label}/{}", name.to_string_lossy()),
+                    reason: "unexpected entry beside devices".to_string(),
+                });
+            }
+        }
+        let devices_label = format!("{uid_label}/devices");
+        let Some(devices) = self.open_dir_read(user_dir.as_fd(), "devices", &devices_label)? else {
+            return Ok(Vec::new());
+        };
+        self.read_devices_dir(devices.as_fd(), uid, &devices_label)
     }
 
     /// Read and validate every device file in one user's `devices/` directory.
@@ -541,12 +574,13 @@ impl Registry {
         &self,
         devices: BorrowedFd<'_>,
         uid: u32,
+        label: &str,
     ) -> Result<Vec<DeviceRecord>, RegistryError> {
         let mut out = Vec::new();
-        for name in dir_entries(devices, "devices")? {
+        for name in dir_entries(devices, label)? {
             let name_s = name_str(&name)?;
             let device_id = parse_device_filename(name_s).ok_or_else(|| RegistryError::Unsafe {
-                path: name_s.to_string(),
+                path: format!("{label}/{name_s}"),
                 reason: "unexpected entry in devices directory".to_string(),
             })?;
             let bytes = self.read_device_file(devices, name_s)?;
@@ -629,8 +663,15 @@ fn publish(
     }
     match renameat_with(dir, tmp_name.as_str(), dir, final_name, rename_flags) {
         Ok(()) => {
+            // The rename published the record (and, for a replace, removed the temp); disarm so the guard
+            // does not unlink the now-published name.
             guard.disarm();
-            rustix::fs::fsync(dir).map_err(|e| io_err(base_label, e))?;
+            // The directory fsync makes the rename durable. If it fails the change is already applied, so
+            // report DurabilityUncertain (not a plain error) — a retry would hit AlreadyRegistered/Revoked.
+            rustix::fs::fsync(dir).map_err(|e| RegistryError::DurabilityUncertain {
+                path: base_label.to_string(),
+                source: std::io::Error::from_raw_os_error(e.raw_os_error()),
+            })?;
             Ok(())
         }
         Err(Errno::EXIST) => Err(RegistryError::AlreadyRegistered),
@@ -638,80 +679,77 @@ fn publish(
     }
 }
 
-/// fstat-verify a directory fd: a real directory, expected owner, no group/world write.
+/// An `Unsafe` error for `label` with `reason`.
+fn unsafe_err(label: &str, reason: &str) -> RegistryError {
+    RegistryError::Unsafe {
+        path: label.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+/// Verify owner uid/gid and an **exact** permission/special-bit mode. The mode is compared strictly
+/// (not just "no group/world write") so a loosened `0755`/`0644`/`0644`-lock, an unexpected setuid/setgid/
+/// sticky bit, or a group/world-readable relaxation all fail closed (plan D2: dir 0700 / file 0640 /
+/// lock 0600 are fixed).
+fn verify_owner_mode(
+    st: &rustix::fs::Stat,
+    owner_uid: u32,
+    owner_gid: u32,
+    expected_mode: u32,
+    label: &str,
+) -> Result<(), RegistryError> {
+    if st.st_uid != owner_uid || st.st_gid != owner_gid {
+        return Err(unsafe_err(label, "unexpected owner"));
+    }
+    if Mode::from_raw_mode(st.st_mode).bits() != expected_mode {
+        return Err(unsafe_err(label, "unexpected permission bits"));
+    }
+    Ok(())
+}
+
 fn verify_dir(
     fd: BorrowedFd<'_>,
     owner_uid: u32,
     owner_gid: u32,
+    expected_mode: u32,
     label: &str,
 ) -> Result<(), RegistryError> {
     let st = fstat(fd).map_err(|e| io_err(label, e))?;
     if FileType::from_raw_mode(st.st_mode) != FileType::Directory {
-        return Err(RegistryError::Unsafe {
-            path: label.to_string(),
-            reason: "not a directory".to_string(),
-        });
+        return Err(unsafe_err(label, "not a directory"));
     }
-    if st.st_uid != owner_uid || st.st_gid != owner_gid {
-        return Err(RegistryError::Unsafe {
-            path: label.to_string(),
-            reason: "unexpected owner".to_string(),
-        });
-    }
-    if Mode::from_raw_mode(st.st_mode).bits() & 0o022 != 0 {
-        return Err(RegistryError::Unsafe {
-            path: label.to_string(),
-            reason: "group/world writable".to_string(),
-        });
-    }
-    Ok(())
+    verify_owner_mode(&st, owner_uid, owner_gid, expected_mode, label)
 }
 
-/// fstat-verify a regular file fd (used for the lock file): regular, expected owner, no group/world
-/// write, exactly one link.
+/// fstat-verify a regular file fd: regular, expected owner, exact mode, exactly one link.
 fn verify_regular(
     fd: BorrowedFd<'_>,
     owner_uid: u32,
     owner_gid: u32,
+    expected_mode: u32,
     label: &str,
 ) -> Result<(), RegistryError> {
     let st = fstat(fd).map_err(|e| io_err(label, e))?;
     if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
-        return Err(RegistryError::Unsafe {
-            path: label.to_string(),
-            reason: "not a regular file".to_string(),
-        });
+        return Err(unsafe_err(label, "not a regular file"));
     }
-    if st.st_uid != owner_uid || st.st_gid != owner_gid {
-        return Err(RegistryError::Unsafe {
-            path: label.to_string(),
-            reason: "unexpected owner".to_string(),
-        });
-    }
-    if Mode::from_raw_mode(st.st_mode).bits() & 0o022 != 0 {
-        return Err(RegistryError::Unsafe {
-            path: label.to_string(),
-            reason: "group/world writable".to_string(),
-        });
-    }
+    verify_owner_mode(&st, owner_uid, owner_gid, expected_mode, label)?;
     if st.st_nlink != 1 {
-        return Err(RegistryError::Unsafe {
-            path: label.to_string(),
-            reason: "unexpected hard links".to_string(),
-        });
+        return Err(unsafe_err(label, "unexpected hard links"));
     }
     Ok(())
 }
 
-/// Collect a directory's entry names (excluding `.`, `..`, and the reserved lock file). Read fully before
-/// the caller does any `openat`, so directory reads and lookups do not interleave on the same fd.
+/// Collect a directory's entry names (excluding only `.` and `..`). The reserved lock file lives at the
+/// base directory, which is never enumerated, so any `.registry.lock` (or other unexpected name) appearing
+/// inside `users/`/`devices/` is returned to the caller and rejected there — nothing is silently skipped.
 fn dir_entries(dirfd: BorrowedFd<'_>, label: &str) -> Result<Vec<CString>, RegistryError> {
     let dir = Dir::read_from(dirfd).map_err(|e| io_err(label, e))?;
     let mut names = Vec::new();
     for entry in dir {
         let entry = entry.map_err(|e| io_err(label, e))?;
         let name = entry.file_name();
-        if name == c"." || name == c".." || name.to_bytes() == LOCK_NAME.as_bytes() {
+        if name == c"." || name == c".." {
             continue;
         }
         names.push(name.to_owned());
@@ -836,9 +874,10 @@ fn decode_record(
     }
     crypto::p256_ecdsa::validate_public_key(&sec1).map_err(|_| corrupt("sec1 not a P-256 key"))?;
     let label = label.ok_or_else(|| corrupt("missing label"))?;
-    if label.len() > LABEL_MAX_BYTES {
-        return Err(corrupt("label too long"));
-    }
+    // Enforce the full text policy on the stored label too, so a tampered on-disk record with control /
+    // bidi / non-NFC bytes fails closed instead of reaching `list` output.
+    text::check(&label, 0, LABEL_MAX_BYTES, false)
+        .map_err(|_| corrupt("label violates text policy"))?;
     let created_at = created_at.ok_or_else(|| corrupt("missing created_at"))?;
     Ok(DeviceRecord {
         uid,
@@ -880,16 +919,12 @@ fn validate_uid(uid: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a label under the shared text policy (NUL/C0/C1 control, bidi controls, Unicode 16.0
+/// unassigned, and non-NFC are all rejected), length 0..=128 (empty = "no label"). Using the same
+/// `bifrauth_proto::text` policy as the wire messages keeps `list` output free of terminal escapes,
+/// line breaks, and bidi/spoofing tricks.
 fn validate_label(label: &str) -> Result<(), RegistryError> {
-    if label.len() > LABEL_MAX_BYTES {
-        return Err(RegistryError::InvalidLabel);
-    }
-    // Reject control characters (incl. NUL) so a label cannot smuggle terminal escapes or line breaks
-    // into `list` output; the empty string is allowed and means "no label".
-    if label.chars().any(|c| c.is_control()) {
-        return Err(RegistryError::InvalidLabel);
-    }
-    Ok(())
+    text::check(label, 0, LABEL_MAX_BYTES, false).map_err(|_| RegistryError::InvalidLabel)
 }
 
 /// The canonical device filename for a device id: 32 lowercase hex chars + ".cbor".
@@ -1013,5 +1048,456 @@ fn dir_open_err(label: &str, e: Errno) -> RegistryError {
         }
     } else {
         io_err(label, e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! On-disk safety, concurrency, and schema tests. They run unprivileged against a temp directory the
+    //! test user owns, via the cfg(test)-only `open_with_owner`, so the symlink/mode/traversal checks are
+    //! still exercised (ownership is the only environment-dependent check).
+    use super::*;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // A valid P-256 SEC1 public key for a given seed, via the mock device (dev-dependency).
+    fn sec1_key(seed: u8) -> Vec<u8> {
+        mock_iphone::MockIphone::new([0x11; 16], &[seed; 32], [0u8; 32], [0x22; 16])
+            .unwrap()
+            .device_public_key_sec1()
+            .to_vec()
+    }
+
+    fn me() -> (u32, u32) {
+        (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        )
+    }
+
+    struct TempBase {
+        path: PathBuf,
+    }
+
+    impl TempBase {
+        fn new() -> Self {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "bifrauth-reg-test-{}-{}",
+                std::process::id(),
+                n
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            TempBase { path }
+        }
+
+        fn open(&self) -> Registry {
+            let (uid, gid) = me();
+            Registry::open_with_owner(&self.path, uid, gid).unwrap()
+        }
+
+        fn devices_dir(&self, uid: u32) -> PathBuf {
+            self.path
+                .join("users")
+                .join(uid.to_string())
+                .join("devices")
+        }
+    }
+
+    impl Drop for TempBase {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    const T_UID: u32 = 4242;
+    const DEV_A: [u8; 16] = [0xA1; 16];
+    const DEV_B: [u8; 16] = [0xB2; 16];
+
+    #[test]
+    fn register_list_roundtrip_and_load_snapshot() {
+        let base = TempBase::new();
+        let reg = base.open();
+        reg.register(T_UID, DEV_A, &sec1_key(1), "phone", 1000)
+            .unwrap();
+
+        let list = reg.list(T_UID).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].device_id, DEV_A);
+        assert_eq!(list[0].label, "phone");
+        assert_eq!(list[0].created_at, 1000);
+        assert!(!list[0].is_revoked());
+
+        let mut v = crate::Verifier::new([0x03; 32], crate::BoottimeClock);
+        v.replace_devices(reg.load_all().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn register_duplicate_is_rejected_without_changing_bytes() {
+        let base = TempBase::new();
+        let reg = base.open();
+        reg.register(T_UID, DEV_A, &sec1_key(1), "first", 1000)
+            .unwrap();
+        let before = std::fs::read(base.devices_dir(T_UID).join(device_filename(&DEV_A))).unwrap();
+
+        let err = reg
+            .register(T_UID, DEV_A, &sec1_key(2), "second", 2000)
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::AlreadyRegistered));
+        let after = std::fs::read(base.devices_dir(T_UID).join(device_filename(&DEV_A))).unwrap();
+        assert_eq!(before, after, "duplicate register must not overwrite");
+    }
+
+    #[test]
+    fn revoke_is_one_way_and_preserves_bytes_on_repeat() {
+        let base = TempBase::new();
+        let reg = base.open();
+        assert!(matches!(
+            reg.revoke(T_UID, DEV_A, 500).unwrap_err(),
+            RegistryError::NotRegistered
+        ));
+
+        reg.register(T_UID, DEV_A, &sec1_key(1), "phone", 1000)
+            .unwrap();
+        reg.revoke(T_UID, DEV_A, 2000).unwrap();
+        assert_eq!(reg.list(T_UID).unwrap()[0].revoked_at, Some(2000));
+
+        let before = std::fs::read(base.devices_dir(T_UID).join(device_filename(&DEV_A))).unwrap();
+        assert!(matches!(
+            reg.revoke(T_UID, DEV_A, 3000).unwrap_err(),
+            RegistryError::AlreadyRevoked
+        ));
+        let after = std::fs::read(base.devices_dir(T_UID).join(device_filename(&DEV_A))).unwrap();
+        assert_eq!(before, after);
+
+        assert!(matches!(
+            reg.register(T_UID, DEV_A, &sec1_key(9), "new", 4000)
+                .unwrap_err(),
+            RegistryError::AlreadyRegistered
+        ));
+    }
+
+    #[test]
+    fn concurrent_register_same_device_has_exactly_one_winner() {
+        let base = TempBase::new();
+        let path = base.path.clone();
+        let (uid, gid) = me();
+
+        let mut handles = Vec::new();
+        for seed in 0u8..8 {
+            let p = path.clone();
+            handles.push(std::thread::spawn(move || {
+                let reg = Registry::open_with_owner(&p, uid, gid).unwrap();
+                reg.register(T_UID, DEV_A, &sec1_key(seed.max(1)), "x", 1000)
+                    .is_ok()
+            }));
+        }
+        let winners = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            winners, 1,
+            "renameat2(RENAME_NOREPLACE) + flock admit exactly one register (OFD mutual exclusion)"
+        );
+        assert_eq!(base.open().list(T_UID).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_register_distinct_devices_all_persist() {
+        let base = TempBase::new();
+        let path = base.path.clone();
+        let (uid, gid) = me();
+
+        let mut handles = Vec::new();
+        for seed in 1u8..=16 {
+            let p = path.clone();
+            handles.push(std::thread::spawn(move || {
+                let reg = Registry::open_with_owner(&p, uid, gid).unwrap();
+                let mut id = [0u8; 16];
+                id[0] = seed;
+                reg.register(T_UID, id, &sec1_key(seed), "x", 1000).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let reg = base.open();
+        assert_eq!(reg.list(T_UID).unwrap().len(), 16);
+        let mut v = crate::Verifier::new([0x03; 32], crate::BoottimeClock);
+        v.replace_devices(reg.load_all().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn intermediate_directory_symlink_is_rejected() {
+        let base = TempBase::new();
+        let reg = base.open();
+        reg.register(T_UID, DEV_A, &sec1_key(1), "x", 1000).unwrap();
+
+        let devices = base.devices_dir(T_UID);
+        let evil = base.path.join("evil");
+        std::fs::create_dir(&evil).unwrap();
+        std::fs::remove_dir_all(&devices).unwrap();
+        symlink(&evil, &devices).unwrap();
+
+        assert!(matches!(
+            reg.list(T_UID).unwrap_err(),
+            RegistryError::Unsafe { .. }
+        ));
+    }
+
+    #[test]
+    fn device_file_symlink_is_rejected() {
+        let base = TempBase::new();
+        let reg = base.open();
+        reg.register(T_UID, DEV_A, &sec1_key(1), "x", 1000).unwrap();
+
+        let file = base.devices_dir(T_UID).join(device_filename(&DEV_A));
+        let target = base.path.join("secret");
+        std::fs::write(&target, b"whatever").unwrap();
+        std::fs::remove_file(&file).unwrap();
+        symlink(&target, &file).unwrap();
+
+        assert!(matches!(
+            reg.list(T_UID).unwrap_err(),
+            RegistryError::Unsafe { .. }
+        ));
+    }
+
+    #[test]
+    fn non_regular_device_entry_is_rejected() {
+        let base = TempBase::new();
+        let reg = base.open();
+        reg.register(T_UID, DEV_A, &sec1_key(1), "x", 1000).unwrap();
+        std::fs::create_dir(base.devices_dir(T_UID).join(device_filename(&DEV_B))).unwrap();
+        assert!(matches!(
+            reg.list(T_UID).unwrap_err(),
+            RegistryError::Unsafe { .. }
+        ));
+    }
+
+    #[test]
+    fn unexpected_entry_in_devices_dir_fails_closed() {
+        let base = TempBase::new();
+        let reg = base.open();
+        reg.register(T_UID, DEV_A, &sec1_key(1), "x", 1000).unwrap();
+        std::fs::write(base.devices_dir(T_UID).join("garbage.txt"), b"junk").unwrap();
+        assert!(matches!(
+            reg.list(T_UID).unwrap_err(),
+            RegistryError::Unsafe { .. }
+        ));
+    }
+
+    #[test]
+    fn reserved_lock_name_inside_devices_dir_is_not_silently_skipped() {
+        // A file literally named .registry.lock inside a devices dir must fail closed (it is only reserved
+        // at the base directory, which is never enumerated).
+        let base = TempBase::new();
+        let reg = base.open();
+        reg.register(T_UID, DEV_A, &sec1_key(1), "x", 1000).unwrap();
+        std::fs::write(base.devices_dir(T_UID).join(LOCK_NAME), b"x").unwrap();
+        assert!(matches!(
+            reg.list(T_UID).unwrap_err(),
+            RegistryError::Unsafe { .. }
+        ));
+    }
+
+    #[test]
+    fn unexpected_sibling_beside_devices_is_rejected() {
+        let base = TempBase::new();
+        let reg = base.open();
+        reg.register(T_UID, DEV_A, &sec1_key(1), "x", 1000).unwrap();
+        // A stray file next to `devices` inside users/<uid> must fail closed.
+        std::fs::write(
+            base.path.join("users").join(T_UID.to_string()).join("note"),
+            b"x",
+        )
+        .unwrap();
+        assert!(matches!(
+            reg.list(T_UID).unwrap_err(),
+            RegistryError::Unsafe { .. }
+        ));
+    }
+
+    #[test]
+    fn hardlinked_device_file_is_rejected() {
+        let base = TempBase::new();
+        let reg = base.open();
+        reg.register(T_UID, DEV_A, &sec1_key(1), "x", 1000).unwrap();
+        let a = base.devices_dir(T_UID).join(device_filename(&DEV_A));
+        let b = base.devices_dir(T_UID).join(device_filename(&DEV_B));
+        std::fs::hard_link(&a, &b).unwrap();
+        assert!(matches!(
+            reg.list(T_UID).unwrap_err(),
+            RegistryError::Unsafe { .. }
+        ));
+    }
+
+    // Write a device file at the canonical name with the exact expected modes (dir 0700 / file 0640) so
+    // reads reach the decode/size checks rather than tripping the strict mode check first.
+    fn write_device_file(dir: &std::path::Path, id: &[u8; 16], bytes: &[u8]) {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(dir)
+            .unwrap();
+        let p = dir.join(device_filename(id));
+        std::fs::write(&p, bytes).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
+    }
+
+    #[test]
+    fn corrupt_and_oversize_records_fail_closed() {
+        let base = TempBase::new();
+        let reg = base.open();
+        let dev_dir = base.devices_dir(T_UID);
+        write_device_file(&dev_dir, &DEV_A, b"\xff\xff\xff\xff");
+        assert!(matches!(
+            reg.list(T_UID).unwrap_err(),
+            RegistryError::Corrupt { .. }
+        ));
+        write_device_file(&dev_dir, &DEV_A, &vec![0u8; 5000]);
+        assert!(matches!(
+            reg.list(T_UID).unwrap_err(),
+            RegistryError::Corrupt { .. }
+        ));
+    }
+
+    #[test]
+    fn non_canonical_uid_directory_is_rejected() {
+        let base = TempBase::new();
+        let reg = base.open();
+        reg.register(T_UID, DEV_A, &sec1_key(1), "x", 1000).unwrap();
+        std::fs::create_dir_all(base.path.join("users").join("007").join("devices")).unwrap();
+        assert!(matches!(
+            reg.list_all().unwrap_err(),
+            RegistryError::Unsafe { .. }
+        ));
+    }
+
+    #[test]
+    fn lock_file_symlink_is_rejected() {
+        let base = TempBase::new();
+        let target = base.path.join("lock-target");
+        std::fs::write(&target, b"x").unwrap();
+        symlink(&target, base.path.join(LOCK_NAME)).unwrap();
+        let reg = base.open();
+        assert!(matches!(
+            reg.register(T_UID, DEV_A, &sec1_key(1), "x", 1000)
+                .unwrap_err(),
+            RegistryError::Unsafe { .. }
+        ));
+    }
+
+    #[test]
+    fn group_writable_lock_file_is_rejected() {
+        let base = TempBase::new();
+        let reg = base.open();
+        reg.register(T_UID, DEV_A, &sec1_key(1), "x", 1000).unwrap();
+        std::fs::set_permissions(
+            base.path.join(LOCK_NAME),
+            std::fs::Permissions::from_mode(0o660),
+        )
+        .unwrap();
+        assert!(matches!(
+            reg.list(T_UID).unwrap_err(),
+            RegistryError::Unsafe { .. }
+        ));
+    }
+
+    #[test]
+    fn group_readable_device_file_is_rejected() {
+        // Strict mode: a device file loosened to 0644 (group/world readable) must fail closed, not just
+        // group/world *writable* (the record could contain no secret, but the fixed-mode invariant guards
+        // against tampering more broadly).
+        let base = TempBase::new();
+        let reg = base.open();
+        reg.register(T_UID, DEV_A, &sec1_key(1), "x", 1000).unwrap();
+        std::fs::set_permissions(
+            base.devices_dir(T_UID).join(device_filename(&DEV_A)),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(matches!(
+            reg.list(T_UID).unwrap_err(),
+            RegistryError::Unsafe { .. }
+        ));
+    }
+
+    #[test]
+    fn loosened_directory_mode_is_rejected() {
+        let base = TempBase::new();
+        let reg = base.open();
+        reg.register(T_UID, DEV_A, &sec1_key(1), "x", 1000).unwrap();
+        std::fs::set_permissions(
+            base.devices_dir(T_UID),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(matches!(
+            reg.list(T_UID).unwrap_err(),
+            RegistryError::Unsafe { .. }
+        ));
+    }
+
+    #[test]
+    fn label_text_policy_on_register() {
+        let base = TempBase::new();
+        let reg = base.open();
+        // Empty label is allowed (means "no label").
+        reg.register(T_UID, DEV_A, &sec1_key(1), "", 1000).unwrap();
+        assert_eq!(reg.list(T_UID).unwrap()[0].label, "");
+        // Control chars, bidi override, and overlong labels are rejected.
+        for bad in ["bad\nname", "a\u{202e}b", &"x".repeat(200)] {
+            assert!(
+                matches!(
+                    reg.register(T_UID, DEV_B, &sec1_key(2), bad, 1000)
+                        .unwrap_err(),
+                    RegistryError::InvalidLabel
+                ),
+                "label {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn tampered_label_on_disk_fails_closed() {
+        // A hand-written record carrying a bidi/control label must be rejected by load/list so it never
+        // reaches terminal output.
+        let base = TempBase::new();
+        let reg = base.open();
+        let dev_dir = base.devices_dir(T_UID);
+        // Build a record whose label contains an RLO override (a valid CBOR record, invalid text policy).
+        let rec = DeviceRecord {
+            uid: T_UID,
+            device_id: DEV_A,
+            sec1: sec1_key(1),
+            label: "a\u{202e}b".to_string(),
+            created_at: 1000,
+            revoked_at: None,
+        };
+        write_device_file(&dev_dir, &DEV_A, &encode_record(&rec));
+        assert!(matches!(
+            reg.list(T_UID).unwrap_err(),
+            RegistryError::Corrupt { .. }
+        ));
+    }
+
+    #[test]
+    fn invalid_public_key_is_rejected() {
+        let base = TempBase::new();
+        let reg = base.open();
+        assert!(matches!(
+            reg.register(T_UID, DEV_A, &[0u8; 5], "x", 1000)
+                .unwrap_err(),
+            RegistryError::InvalidPublicKey
+        ));
     }
 }

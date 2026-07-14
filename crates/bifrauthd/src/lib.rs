@@ -27,6 +27,9 @@ pub mod serve;
 pub mod session;
 pub mod systemd;
 
+#[cfg(test)]
+mod e2e_tests;
+
 use bifrauth_crypto as crypto;
 pub use bifrauth_ipc::{BoottimeClock, Clock};
 use bifrauth_proto::{Challenge, Envelope, Response, SchemaError};

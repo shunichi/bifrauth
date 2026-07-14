@@ -12,5 +12,10 @@ bifrauth-ipc = { version = "0.1.0", path = "../bifrauth-ipc" }
 rustix = { workspace = true, features = ["net", "process", "fs"] }
 uzers = { workspace = true }
 
+[features]
+# Exposes Registry::open_with_owner (arbitrary owner uid/gid) for unprivileged tests only. Never enable
+# in production; the constructor is absent from the default (production) build.
+testing = []
+
 [dev-dependencies]
 mock-iphone = { path = "../mock-iphone" }

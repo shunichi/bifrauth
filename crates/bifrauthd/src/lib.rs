@@ -180,6 +180,16 @@ impl DeviceSnapshot {
     pub fn builder() -> DeviceSnapshotBuilder {
         DeviceSnapshotBuilder::default()
     }
+
+    /// Total number of device registrations (across all uids) in this snapshot.
+    pub fn len(&self) -> usize {
+        self.devices.values().map(|m| m.len()).sum()
+    }
+
+    /// Whether the snapshot holds no registrations.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl DeviceSnapshotBuilder {

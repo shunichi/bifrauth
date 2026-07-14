@@ -315,6 +315,21 @@ impl Registry {
     /// interleave). Fails closed on any corrupt/unsafe entry rather than dropping it.
     pub fn load_all(&self) -> Result<DeviceSnapshot, RegistryError> {
         let _lock = self.lock(FlockOperation::LockShared)?;
+        self.build_snapshot()
+    }
+
+    /// Like [`load_all`](Self::load_all) but runs `gate` while holding the shared lock, before enumerating.
+    /// Test-only: it lets a test observe that a concurrent writer (LOCK_EX) cannot complete while the
+    /// snapshot is being built, pinning the point-in-time guarantee against future lock-scope regressions.
+    #[cfg(test)]
+    fn load_all_gated(&self, gate: impl FnOnce()) -> Result<DeviceSnapshot, RegistryError> {
+        let _lock = self.lock(FlockOperation::LockShared)?;
+        gate();
+        self.build_snapshot()
+    }
+
+    /// Enumerate + validate + build a snapshot. Assumes the caller holds the shared lock.
+    fn build_snapshot(&self) -> Result<DeviceSnapshot, RegistryError> {
         let records = self.enumerate_all()?;
         let mut builder = DeviceSnapshot::builder();
         for r in &records {
@@ -1208,6 +1223,52 @@ mod tests {
             "renameat2(RENAME_NOREPLACE) + flock admit exactly one register (OFD mutual exclusion)"
         );
         assert_eq!(base.open().list(T_UID).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn load_all_is_point_in_time_against_a_concurrent_writer() {
+        // Directly pin the point-in-time guarantee (codex round-2 suggestion): while load_all holds the
+        // shared lock, a concurrent register (exclusive lock) from another Registry/OFD cannot complete,
+        // so its device is absent from the snapshot; once the lock releases, the write lands and the next
+        // snapshot sees it. A future regression that narrowed the lock scope would fail this test.
+        use std::sync::mpsc;
+
+        let base = TempBase::new();
+        let path = base.path.clone();
+        let (uid, gid) = me();
+
+        let reg = base.open();
+        reg.register(T_UID, DEV_A, &sec1_key(1), "a", 1000).unwrap();
+
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            let w = Registry::open_with_owner(&path, uid, gid).unwrap();
+            go_rx.recv().unwrap(); // wait until the reader holds the shared lock
+            ready_tx.send(()).unwrap(); // announce we are about to attempt the exclusive-locked write
+            // This blocks on LOCK_EX until the reader releases the shared lock.
+            w.register(T_UID, DEV_B, &sec1_key(2), "b", 2000).unwrap();
+        });
+
+        // Snapshot taken while, inside the gate, the writer is signalled and reaches its register call.
+        // Because we still hold LOCK_SH throughout enumeration, the writer's LOCK_EX cannot be granted, so
+        // DEV_B cannot have been written yet — the snapshot must contain only DEV_A. (Asserted on the
+        // snapshot itself, not a later list, which would race the now-unblocked writer.)
+        let snapshot = reg
+            .load_all_gated(|| {
+                go_tx.send(()).unwrap();
+                ready_rx.recv().unwrap();
+            })
+            .unwrap();
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "point-in-time snapshot must exclude the concurrently-blocked writer's device"
+        );
+
+        // After the shared lock released, the writer completes; the next snapshot sees both devices.
+        writer.join().unwrap();
+        assert_eq!(reg.list(T_UID).unwrap().len(), 2);
     }
 
     #[test]

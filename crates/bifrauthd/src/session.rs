@@ -578,6 +578,45 @@ mod tests {
         }
     }
 
+    /// A resolver whose canonical name deliberately differs from the requested alias, to prove the
+    /// challenge binds the canonical identity (not the alias).
+    struct FixedIdentityResolver {
+        requested: &'static str,
+        canonical: &'static str,
+        uid: u32,
+    }
+    impl UserResolver for FixedIdentityResolver {
+        fn resolve(&self, username: &str) -> Option<ResolvedIdentity> {
+            (username == self.requested).then(|| ResolvedIdentity {
+                uid: self.uid,
+                canonical_username: self.canonical.to_string(),
+            })
+        }
+    }
+
+    /// A transport that records the `(target_username, target_uid)` it sees inside the dispatched
+    /// envelope, then produces a valid response so the flow completes.
+    struct RecordingTransport {
+        ph: MockIphone,
+        recorded: std::cell::RefCell<Option<(String, u32)>>,
+    }
+    impl Transport for RecordingTransport {
+        fn dispatch(
+            &self,
+            envelope: &[u8],
+            _deadline: Deadline,
+        ) -> Result<Vec<u8>, TransportError> {
+            let env = bifrauth_proto::Envelope::decode(envelope).expect("valid envelope");
+            let ch = bifrauth_proto::Challenge::decode(&env.canonical_challenge)
+                .expect("valid challenge");
+            *self.recorded.borrow_mut() = Some((ch.target_username.clone(), ch.target_uid));
+            Ok(self
+                .ph
+                .process(envelope)
+                .expect("mock iphone processes envelope"))
+        }
+    }
+
     // ---- a real (non-suspending) clock stand-in: monotonic-ish, fixed for determinism ----
 
     #[derive(Clone, Copy)]
@@ -688,6 +727,39 @@ mod tests {
         assert_eq!(terminal, Terminal::OutcomeSent(OutcomeCode::Success));
         assert_eq!(transport.calls(), 1);
         assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn challenge_binds_resolver_canonical_identity_not_requested_alias() {
+        // The device is registered under UID; the resolver maps the alias "alias" → canonical "alice"/UID.
+        // The challenge inside the dispatched envelope must carry the canonical name and uid, not the alias.
+        let v = verifier_with_device();
+        let clock = FixedClock(1_000_000_000);
+        let transport = RecordingTransport {
+            ph: iphone(&DEVICE_SEED),
+            recorded: std::cell::RefCell::new(None),
+        };
+        let resolver = FixedIdentityResolver {
+            requested: "alias",
+            canonical: "alice",
+            uid: UID,
+        };
+        let mut s = MockStream::new(frame_bytes(&auth_request("bifrauth-login", "alias")))
+            .with_responder(display_ack_responder(true));
+        let terminal = run_connection(
+            &mut s,
+            &v,
+            &clock,
+            &transport,
+            &policy(),
+            &resolver,
+            WALL_EPOCH,
+        );
+        assert_eq!(terminal, Terminal::OutcomeSent(OutcomeCode::Success));
+        let rec = transport.recorded.borrow();
+        let (username, uid) = rec.as_ref().expect("transport was dispatched");
+        assert_eq!(username, "alice"); // canonical name from the resolver, not "alias"
+        assert_eq!(*uid, UID);
     }
 
     #[test]

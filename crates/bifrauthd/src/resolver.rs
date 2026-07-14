@@ -48,18 +48,23 @@ mod tests {
     }
 
     /// If we can identify the current user via NSS, the resolved uid must match this process's uid and the
-    /// canonical name must be non-empty. Skips where the environment does not expose a resolvable name.
+    /// canonical name must be non-empty. Uses `get_current_username()` (from the same NSS library) rather
+    /// than `$USER`, so a spoofed environment variable cannot skew the check. Skips where the current user
+    /// is not resolvable (e.g. a nameless/dynamic uid).
     #[test]
     fn resolves_the_current_user_to_its_uid() {
-        let Ok(name) = std::env::var("USER") else {
-            eprintln!("skipping: $USER not set");
+        let Some(name) = uzers::get_current_username() else {
+            eprintln!("skipping: current username not resolvable");
+            return;
+        };
+        let Some(name) = name.to_str() else {
+            eprintln!("skipping: current username is not UTF-8");
             return;
         };
         let r = UzersResolver;
-        match r.resolve(&name) {
+        match r.resolve(name) {
             Some(id) => {
-                let self_uid = rustix::process::getuid().as_raw();
-                assert_eq!(id.uid, self_uid);
+                assert_eq!(id.uid, rustix::process::getuid().as_raw());
                 assert!(!id.canonical_username.is_empty());
             }
             None => eprintln!("skipping: '{name}' does not resolve via NSS in this environment"),

@@ -53,6 +53,11 @@ version = "0.1.0"
 [[package]]
 name = "bifrauthctl"
 version = "0.1.0"
+dependencies = [
+ "bifrauthd",
+ "mock-iphone",
+ "rustix",
+]
 
 [[package]]
 name = "bifrauthd"

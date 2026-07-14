@@ -9,7 +9,7 @@ license.workspace = true
 bifrauth-crypto = { version = "0.1.0", path = "../bifrauth-crypto" }
 bifrauth-proto = { version = "0.1.0", path = "../bifrauth-proto" }
 bifrauth-ipc = { version = "0.1.0", path = "../bifrauth-ipc" }
-rustix = { workspace = true, features = ["net", "process"] }
+rustix = { workspace = true, features = ["net", "process", "fs"] }
 uzers = { workspace = true }
 
 [dev-dependencies]

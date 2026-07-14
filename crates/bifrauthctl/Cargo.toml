@@ -6,3 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bifrauthd = { version = "0.1.0", path = "../bifrauthd" }
+rustix = { workspace = true, features = ["process"] }
+
+[dev-dependencies]
+mock-iphone = { path = "../mock-iphone" }

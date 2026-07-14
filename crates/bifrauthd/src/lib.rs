@@ -4,8 +4,8 @@
 //! requests with a CLOCK_BOOTTIME deadline, and verify iPhone responses (design §9.7, §15.3, §16, §11).
 //!
 //! This module is a library with no socket/IPC. The root Unix socket IPC (SO_PEERCRED, framing, the
-//! confirmation-code notification) and the bifrauthctl CLI are separate follow-up tasks. It builds on
-//! [`bifrauth_proto`] and [`bifrauth_crypto`].
+//! confirmation-code notification) lives in [`session`]/[`serve`]; the admin CLI is the `bifrauthctl`
+//! binary, which drives [`registry`]. It builds on [`bifrauth_proto`] and [`bifrauth_crypto`].
 //!
 //! Trust model: the verifier is the sole source of truth. The TTL authority is `CLOCK_BOOTTIME`
 //! (suspend-inclusive), not the wall clock. The response's `signed_payload_hash` is recomputed and never
@@ -15,9 +15,13 @@
 //! atomic. The IPC layer serializes only these short state transitions (issue / cancel / verify) under a
 //! mutex and releases it during socket and transport I/O (see [`session`]).
 //!
-//! This core assumes registered device keys are already validated and non-revoked; revocation lives in the
-//! registry/CLI (task 0009).
+//! Device registry: the persistent, root-owned store lives in [`registry`]; this core holds an in-memory
+//! copy for verification. Revocation is a one-way tombstone: a revoked device stays known (so a re-register
+//! is refused, design §14.2) but fails verification ([`VerifyError::RevokedDevice`], design §9.7/§18.3).
+//! The daemon loads a validated point-in-time [`DeviceSnapshot`] and installs it atomically via
+//! [`Verifier::replace_devices`] (task 0009).
 
+pub mod registry;
 pub mod resolver;
 pub mod serve;
 pub mod session;
@@ -68,6 +72,9 @@ pub enum VerifyError {
     Expired,
     /// The response's iphone_device_id is not registered for the request's uid.
     UnregisteredDevice,
+    /// The device is registered but revoked (design §9.7 step 11, §18.3). Distinguished from
+    /// `UnregisteredDevice` for audit/observability; both consume the request and deny.
+    RevokedDevice,
     /// The recomputed SHA-256 of the canonical challenge does not match the response's
     /// signed_payload_hash (malformed). Note: the hash is never used as a signature input.
     HashMismatch,
@@ -81,7 +88,27 @@ pub enum RegisterError {
     /// The bytes do not parse as a P-256 SEC1 public key.
     InvalidPublicKey,
     /// A key is already registered for this (uid, device_id); use a separate update/revoke path.
+    /// A revoked (tombstoned) registration also counts as already registered (design §14.2: an old
+    /// key is not silently re-trusted).
     AlreadyRegistered,
+}
+
+/// Errors from [`Verifier::revoke_device`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevokeError {
+    /// No registration exists for this (uid, device_id).
+    NotRegistered,
+    /// The registration is already revoked (revocation is one-way; idempotent callers can ignore this).
+    AlreadyRevoked,
+}
+
+/// Errors from building or installing a [`DeviceSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// A device's stored bytes do not parse as a P-256 SEC1 public key.
+    InvalidPublicKey,
+    /// The same (uid, device_id) appeared twice in the snapshot.
+    Duplicate,
 }
 
 /// The trusted PAM context a challenge is built from (design §9.1). The verifier fills nonce/request_id/
@@ -120,12 +147,78 @@ struct Pending {
     deadline_ns: u64,
 }
 
+/// A registered device: its P-256 SEC1 public key and whether it has been revoked (tombstone).
+#[derive(Debug, Clone)]
+struct DeviceEntry {
+    sec1: Vec<u8>,
+    revoked: bool,
+}
+
+/// The in-memory device map: uid -> (iphone_device_id -> entry).
+type DeviceMap = HashMap<u32, HashMap<[u8; 16], DeviceEntry>>;
+
+/// A validated, point-in-time set of device registrations, ready to install into a [`Verifier`] with
+/// [`Verifier::replace_devices`]. Constructed only via [`DeviceSnapshot::builder`], which validates every
+/// public key and rejects a duplicate (uid, device_id); the private field makes the validated invariant a
+/// type guarantee, so a caller cannot inject an unvalidated registry. See task 0009 plan D4-a.
+#[derive(Debug, Clone, Default)]
+pub struct DeviceSnapshot {
+    devices: DeviceMap,
+}
+
+/// Accumulates device records into a [`DeviceSnapshot`], validating as it goes.
+#[derive(Debug, Default)]
+pub struct DeviceSnapshotBuilder {
+    devices: DeviceMap,
+}
+
+impl DeviceSnapshot {
+    /// Start building a snapshot.
+    pub fn builder() -> DeviceSnapshotBuilder {
+        DeviceSnapshotBuilder::default()
+    }
+}
+
+impl DeviceSnapshotBuilder {
+    /// Add one device. The SEC1 bytes are validated as a P-256 public key; a repeated (uid, device_id)
+    /// is rejected (the registry stores one file per pair, so a duplicate signals corruption).
+    pub fn add(
+        &mut self,
+        uid: u32,
+        device_id: [u8; 16],
+        p256_sec1: &[u8],
+        revoked: bool,
+    ) -> Result<(), SnapshotError> {
+        crypto::p256_ecdsa::validate_public_key(p256_sec1)
+            .map_err(|_| SnapshotError::InvalidPublicKey)?;
+        let per_uid = self.devices.entry(uid).or_default();
+        if per_uid.contains_key(&device_id) {
+            return Err(SnapshotError::Duplicate);
+        }
+        per_uid.insert(
+            device_id,
+            DeviceEntry {
+                sec1: p256_sec1.to_vec(),
+                revoked,
+            },
+        );
+        Ok(())
+    }
+
+    /// Finish building.
+    pub fn build(self) -> DeviceSnapshot {
+        DeviceSnapshot {
+            devices: self.devices,
+        }
+    }
+}
+
 /// The root verifier state machine.
 pub struct Verifier<C: Clock = BoottimeClock> {
     signer: crypto::ed25519::Signer,
     verifier_key_id: [u8; 32],
-    /// Registered device P-256 SEC1 public keys: uid -> (iphone_device_id -> SEC1 bytes).
-    devices: HashMap<u32, HashMap<[u8; 16], Vec<u8>>>,
+    /// Registered device public keys (with per-device revocation state).
+    devices: DeviceMap,
     pending: HashMap<[u8; 16], Pending>,
     /// Concurrent pending count per uid (kept in sync with `pending` for the §15.3 cap).
     per_uid: HashMap<u32, usize>,
@@ -154,7 +247,8 @@ impl<C: Clock> Verifier<C> {
     }
 
     /// Register an iPhone device's P-256 SEC1 public key for a uid. The key is parsed/validated, and an
-    /// existing (uid, device_id) registration is not silently overwritten.
+    /// existing (uid, device_id) registration — active *or* revoked — is not silently overwritten
+    /// (design §14.2). Registers as non-revoked.
     pub fn register_device(
         &mut self,
         uid: u32,
@@ -167,7 +261,54 @@ impl<C: Clock> Verifier<C> {
         if entry.contains_key(&iphone_device_id) {
             return Err(RegisterError::AlreadyRegistered);
         }
-        entry.insert(iphone_device_id, p256_sec1.to_vec());
+        entry.insert(
+            iphone_device_id,
+            DeviceEntry {
+                sec1: p256_sec1.to_vec(),
+                revoked: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Revoke a registered device (a one-way tombstone). A revoked device remains known — so it still
+    /// counts as registered for [`register_device`] — but fails verification with
+    /// [`VerifyError::RevokedDevice`]. Revoking an already-revoked device is [`RevokeError::AlreadyRevoked`].
+    ///
+    /// This mutates only the in-memory copy (used by a future running-daemon reload path); the persistent
+    /// tombstone is written by [`registry::Registry::revoke`]. The daemon's startup path installs revoked
+    /// state via [`Verifier::replace_devices`], not this method.
+    pub fn revoke_device(
+        &mut self,
+        uid: u32,
+        iphone_device_id: [u8; 16],
+    ) -> Result<(), RevokeError> {
+        let entry = self
+            .devices
+            .get_mut(&uid)
+            .and_then(|m| m.get_mut(&iphone_device_id))
+            .ok_or(RevokeError::NotRegistered)?;
+        if entry.revoked {
+            return Err(RevokeError::AlreadyRevoked);
+        }
+        entry.revoked = true;
+        Ok(())
+    }
+
+    /// Atomically replace the entire device registry with a validated point-in-time snapshot (design
+    /// §14.2 / task 0009 D4-a). This is the daemon's reload path: the whole map is swapped in one
+    /// operation so a partially-applied or stale registry is never observable, and pending requests are
+    /// untouched (they are keyed independently). Every entry's public key is re-validated here as a
+    /// defense in depth even though [`DeviceSnapshot`] can only be built through its validating builder;
+    /// on any invalid key nothing is swapped (fail closed).
+    pub fn replace_devices(&mut self, snapshot: DeviceSnapshot) -> Result<(), SnapshotError> {
+        for per_uid in snapshot.devices.values() {
+            for entry in per_uid.values() {
+                crypto::p256_ecdsa::validate_public_key(&entry.sec1)
+                    .map_err(|_| SnapshotError::InvalidPublicKey)?;
+            }
+        }
+        self.devices = snapshot.devices;
         Ok(())
     }
 
@@ -322,17 +463,22 @@ impl<C: Clock> Verifier<C> {
             return Err(VerifyError::Expired);
         }
         // The device must be registered for this uid.
-        let dev_pk = self
+        let device = self
             .devices
             .get(&pending.uid)
             .and_then(|m| m.get(&resp.iphone_device_id))
             .ok_or(VerifyError::UnregisteredDevice)?;
+        // A revoked device is known but must never authenticate (design §9.7 step 11, §18.3). The request
+        // is already consumed above, so a revoked device also spends its request_id.
+        if device.revoked {
+            return Err(VerifyError::RevokedDevice);
+        }
         // Recompute the hash; the response value must match (malformed otherwise) but is never a sig input.
         if resp.signed_payload_hash != crypto::sha256(&pending.canonical) {
             return Err(VerifyError::HashMismatch);
         }
         // Verify the P-256 signature over the stored canonical bytes.
-        crypto::p256_ecdsa::verify(dev_pk, &pending.canonical, &resp.signature)
+        crypto::p256_ecdsa::verify(&device.sec1, &pending.canonical, &resp.signature)
             .map_err(|_| VerifyError::SignatureInvalid)?;
 
         Ok(resp.request_id)
@@ -604,5 +750,96 @@ mod tests {
             v.register_device(UID, IPHONE_DEV, &ph.device_public_key_sec1()),
             Err(RegisterError::AlreadyRegistered)
         );
+    }
+
+    #[test]
+    fn revoked_device_fails_verify_and_consumes() {
+        let (mut v, ph) = setup(MockClock::new(1_000_000_000));
+        v.revoke_device(UID, IPHONE_DEV).unwrap();
+        let issued = v.issue_challenge(&ctx()).unwrap();
+        let response = ph.process(&issued.envelope).unwrap();
+        assert_eq!(
+            v.verify_response(&response),
+            Err(VerifyError::RevokedDevice)
+        );
+        // The request_id is consumed even on a revoked-device denial.
+        assert_eq!(
+            v.verify_response(&response),
+            Err(VerifyError::UnknownOrConsumedRequest)
+        );
+        assert_eq!(v.pending_count(), 0);
+    }
+
+    #[test]
+    fn revoke_is_one_way_and_blocks_reregister() {
+        let (mut v, ph) = setup(MockClock::new(1_000_000_000));
+        // Revoking an unknown device is NotRegistered.
+        assert_eq!(
+            v.revoke_device(UID, [0xAB; 16]),
+            Err(RevokeError::NotRegistered)
+        );
+        v.revoke_device(UID, IPHONE_DEV).unwrap();
+        // A second revoke is AlreadyRevoked.
+        assert_eq!(
+            v.revoke_device(UID, IPHONE_DEV),
+            Err(RevokeError::AlreadyRevoked)
+        );
+        // A revoked registration is still "registered": no silent re-trust (design §14.2).
+        assert_eq!(
+            v.register_device(UID, IPHONE_DEV, &ph.device_public_key_sec1()),
+            Err(RegisterError::AlreadyRegistered)
+        );
+    }
+
+    #[test]
+    fn snapshot_builder_rejects_duplicate_and_invalid_key() {
+        let ph = iphone(&DEVICE_SEED);
+        let mut b = DeviceSnapshot::builder();
+        b.add(UID, IPHONE_DEV, &ph.device_public_key_sec1(), false)
+            .unwrap();
+        // Same (uid, device_id) twice is a Duplicate.
+        assert_eq!(
+            b.add(UID, IPHONE_DEV, &ph.device_public_key_sec1(), false),
+            Err(SnapshotError::Duplicate)
+        );
+        // Invalid SEC1 bytes are rejected.
+        assert_eq!(
+            b.add(UID, [0x01; 16], &[0u8; 5], false),
+            Err(SnapshotError::InvalidPublicKey)
+        );
+    }
+
+    #[test]
+    fn replace_devices_installs_snapshot_atomically() {
+        // A fresh verifier with no devices; install a snapshot with one active device -> verify succeeds.
+        let mut v = Verifier::new(VERIFIER_SEED, MockClock::new(1_000_000_000));
+        let ph = iphone(&DEVICE_SEED);
+        let mut b = DeviceSnapshot::builder();
+        b.add(UID, IPHONE_DEV, &ph.device_public_key_sec1(), false)
+            .unwrap();
+        v.replace_devices(b.build()).unwrap();
+        let issued = v.issue_challenge(&ctx()).unwrap();
+        let response = ph.process(&issued.envelope).unwrap();
+        assert!(v.verify_response(&response).is_ok());
+    }
+
+    #[test]
+    fn pending_response_crossing_a_revoke_boundary_is_denied() {
+        // task 0009 D7: a challenge is issued while the device is active, then the registry is swapped to
+        // a revoked snapshot before the response is verified. The in-flight response must be denied
+        // (RevokedDevice) and consumed — the active snapshot's state must not linger.
+        let (mut v, ph) = setup(MockClock::new(1_000_000_000));
+        let issued = v.issue_challenge(&ctx()).unwrap();
+        let response = ph.process(&issued.envelope).unwrap();
+        // Swap in a snapshot where the same device is revoked.
+        let mut b = DeviceSnapshot::builder();
+        b.add(UID, IPHONE_DEV, &ph.device_public_key_sec1(), true)
+            .unwrap();
+        v.replace_devices(b.build()).unwrap();
+        assert_eq!(
+            v.verify_response(&response),
+            Err(VerifyError::RevokedDevice)
+        );
+        assert_eq!(v.pending_count(), 0);
     }
 }

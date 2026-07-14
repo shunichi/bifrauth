@@ -1,0 +1,24 @@
+# bifrauthd PAM↔verifier IPC socket (ipc-design §2.1, 追補C).
+#
+# systemd is the sole owner of this socket: it creates it with the exact ownership/mode below, so the
+# daemon never binds or chmods it itself (removing unlink/chmod races). The daemon receives the listening
+# FD via socket activation and validates it fully before use (AF_UNIX / SOCK_STREAM / listening / expected
+# path). Exactly one FD is passed.
+[Unit]
+Description=BifrAuth verifier PAM IPC socket
+Documentation=file:docs/ipc-design.md
+
+[Socket]
+ListenStream=/run/bifrauthd/pam.sock
+# root-only access; the daemon additionally enforces SO_PEERCRED uid==0 per connection.
+SocketUser=root
+SocketGroup=root
+SocketMode=0600
+# The parent directory is created root-owned with a restrictive mode.
+RuntimeDirectory=bifrauthd
+RuntimeDirectoryMode=0755
+# One connection = one auth flow; keep the accept path serial and bounded.
+Accept=no
+
+[Install]
+WantedBy=sockets.target

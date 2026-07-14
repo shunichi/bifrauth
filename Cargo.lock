@@ -34,6 +34,10 @@ dependencies = [
 [[package]]
 name = "bifrauth-ipc"
 version = "0.1.0"
+dependencies = [
+ "bifrauth-proto",
+ "rustix",
+]
 
 [[package]]
 name = "bifrauth-proto"
@@ -55,6 +59,7 @@ name = "bifrauthd"
 version = "0.1.0"
 dependencies = [
  "bifrauth-crypto",
+ "bifrauth-ipc",
  "bifrauth-proto",
  "mock-iphone",
  "rustix",

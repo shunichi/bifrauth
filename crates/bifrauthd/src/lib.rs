@@ -12,12 +12,18 @@
 //! used as a signature input; the P-256 signature is verified against the stored canonical bytes.
 //!
 //! Concurrency: all mutation goes through `&mut self`, so within this core the consume-then-verify step is
-//! atomic. The IPC layer must serialize the whole `Verifier` under a single mutex/actor.
+//! atomic. The IPC layer serializes only these short state transitions (issue / cancel / verify) under a
+//! mutex and releases it during socket and transport I/O (see [`session`]).
 //!
 //! This core assumes registered device keys are already validated and non-revoked; revocation lives in the
 //! registry/CLI (task 0009).
 
+pub mod serve;
+pub mod session;
+pub mod systemd;
+
 use bifrauth_crypto as crypto;
+pub use bifrauth_ipc::{BoottimeClock, Clock};
 use bifrauth_proto::{Challenge, Envelope, Response, SchemaError};
 use std::collections::HashMap;
 
@@ -27,24 +33,6 @@ pub const MAX_PENDING_TOTAL: usize = 256;
 pub const MAX_PENDING_PER_UID: usize = 8;
 /// How many times to regenerate a colliding request_id before giving up (astronomically unlikely).
 const MAX_REQUEST_ID_TRIES: u32 = 8;
-
-/// A monotonic boot-time clock in nanoseconds (advances during suspend). Injectable for tests.
-pub trait Clock {
-    fn now_boottime_ns(&self) -> u64;
-}
-
-/// Production clock backed by `clock_gettime(CLOCK_BOOTTIME)`.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct BoottimeClock;
-
-impl Clock for BoottimeClock {
-    fn now_boottime_ns(&self) -> u64 {
-        let ts = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
-        (ts.tv_sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(ts.tv_nsec as u64)
-    }
-}
 
 /// Errors from [`Verifier::issue_challenge`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +173,14 @@ impl<C: Clock> Verifier<C> {
     /// Number of pending requests (for tests/metrics).
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Cancel a pending request by id (used by the IPC session on any abnormal termination after a
+    /// challenge was issued but before a response is verified). Idempotent: cancelling an unknown or
+    /// already-consumed request is a no-op that returns `false`, so a cleanup guard may call it on every
+    /// exit path without risking a double-consume.
+    pub fn cancel_pending(&mut self, request_id: &[u8; 16]) -> bool {
+        self.consume(request_id).is_some()
     }
 
     /// Remove pending requests whose deadline has been reached (called before issuing).

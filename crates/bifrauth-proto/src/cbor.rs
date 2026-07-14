@@ -15,9 +15,11 @@
 //! **Content** constraints such as text NFC / unassigned / control / bidi are handled in layer B
 //! (text policy), in a separate module because they need Unicode data. This layer is structural canonicality only.
 //!
-//! **This module is `pub(crate)` (internal).** An `Ok` from [`scan_structure`] means only "structurally
-//! canonical and valid UTF-8"; it is **not valid as an authentication input** (NFC/text policy + layer-B
-//! schema are also required). Only the validated decoders/encoders of `crate::schema` are public.
+//! **This module is a low-level building block for canonical-CBOR schema authors** (`crate::schema` and
+//! the workspace's `bifrauth-ipc`). An `Ok` from [`scan_structure`] means only "structurally canonical
+//! and valid UTF-8"; it is **not valid as an authentication input** (NFC/text policy + a per-message
+//! layer-B schema are also required). Application logic must only ever handle the validated message
+//! types built on top of this, never a raw [`Value`].
 //!
 //! **Classification of forbidden majors:** major 1 (negative) / 4 (array) / 6 (tag) return
 //! [`Error::ForbiddenMajor`] immediately upon reading the initial byte (without reading ai/body). So e.g.

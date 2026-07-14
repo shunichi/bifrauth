@@ -1,0 +1,37 @@
+# bifrauthd verifier daemon (ipc-design §2.1). Started by socket activation on the first PAM connection.
+#
+# The daemon runs as root (root is the trust boundary, design §4.2): it owns the verifier signing key and
+# is the sole source of auth truth. It receives the listening socket FD from bifrauthd.socket and validates
+# it before serving. The hardening directives below shrink the ambient attack surface without giving up the
+# root capabilities the verifier legitimately needs (reading the key, resolving users).
+[Unit]
+Description=BifrAuth verifier daemon
+Documentation=file:docs/ipc-design.md
+Requires=bifrauthd.socket
+After=bifrauthd.socket
+
+[Service]
+Type=notify
+ExecStart=/usr/lib/bifrauth/bifrauthd
+User=root
+# Socket activation passes exactly one FD; the daemon verifies it.
+# Hardening (defense in depth):
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# The key material lives under a root-only state directory.
+StateDirectory=bifrauthd
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

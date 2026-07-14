@@ -23,7 +23,7 @@ repository = "https://github.com/shunichi/bifrauth"
 # Pin the latest stable version resolved by cargo add etc. (CLAUDE.md library policy).
 [workspace.dependencies]
 unicode-normalization = "0.1.25"
-ed25519-dalek = "3.0.0"
+ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
 p256 = "0.14.0"
 sha2 = "0.11.0"
 getrandom = "0.4.3"

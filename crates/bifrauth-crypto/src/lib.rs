@@ -31,7 +31,10 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 pub mod ed25519 {
     //! Ed25519 (the verifier's challenge signing).
     use super::Error;
-    use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+    // Bring the dalek `Signer` trait into scope for `.sign()` without binding the name (we define our
+    // own `Signer` type below).
+    use ed25519_dalek::Signer as _;
+    use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 
     /// Build a signing key from a 32B secret-key seed.
     pub fn signing_key(seed: &[u8; 32]) -> SigningKey {
@@ -46,6 +49,28 @@ pub mod ed25519 {
     /// Sign `msg` and return the 64B signature.
     pub fn sign(sk: &SigningKey, msg: &[u8]) -> [u8; 64] {
         sk.sign(msg).to_bytes()
+    }
+
+    /// A long-lived Ed25519 signer that owns the expanded [`SigningKey`] and zeroizes it on drop
+    /// (ed25519-dalek `zeroize` feature). Prefer this over holding a raw seed and re-deriving the key
+    /// each time (avoids keeping/copying extra secret material). The seed is consumed at construction.
+    pub struct Signer(SigningKey);
+
+    impl Signer {
+        /// Build a signer from a 32B seed. The caller should drop/zeroize its own copy of the seed.
+        pub fn from_seed(seed: &[u8; 32]) -> Self {
+            Signer(SigningKey::from_bytes(seed))
+        }
+
+        /// The 32B public key.
+        pub fn public_key(&self) -> [u8; 32] {
+            self.0.verifying_key().to_bytes()
+        }
+
+        /// Sign `msg` and return the 64B signature.
+        pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
+            self.0.sign(msg).to_bytes()
+        }
     }
 
     /// **Strictly** verify a 64B signature over `msg` with a 32B public key.
@@ -75,6 +100,13 @@ pub mod p256_ecdsa {
         let vk = VerifyingKey::from_sec1_bytes(pk_sec1).map_err(|_| Error::BadPublicKey)?;
         let sig = Signature::from_der(der_sig).map_err(|_| Error::BadSignature)?;
         vk.verify(msg, &sig).map_err(|_| Error::VerifyFailed)
+    }
+
+    /// Validate that `pk_sec1` parses as a P-256 SEC1 public key (used at device registration).
+    pub fn validate_public_key(pk_sec1: &[u8]) -> Result<(), Error> {
+        VerifyingKey::from_sec1_bytes(pk_sec1)
+            .map(|_| ())
+            .map_err(|_| Error::BadPublicKey)
     }
 }
 
@@ -186,6 +218,32 @@ mod tests {
         // A different key fails.
         let other = ed25519::public_key(&ed25519::signing_key(&[9u8; 32]));
         assert!(ed25519::verify(&other, msg, &sig).is_err());
+    }
+
+    #[test]
+    fn ed25519_signer_matches_free_functions_and_verifies() {
+        let seed = [0x03; 32];
+        let signer = ed25519::Signer::from_seed(&seed);
+        let msg = b"canonical";
+        // The opaque signer agrees with the seed-derived free functions.
+        assert_eq!(
+            signer.public_key(),
+            ed25519::public_key(&ed25519::signing_key(&seed))
+        );
+        let sig = signer.sign(msg);
+        assert!(ed25519::verify(&signer.public_key(), msg, &sig).is_ok());
+    }
+
+    #[test]
+    fn p256_validate_public_key() {
+        use p256::ecdsa::SigningKey;
+        let sk = SigningKey::from_slice(&[0x11u8; 32]).unwrap();
+        let sec1 = sk.verifying_key().to_sec1_bytes();
+        assert!(p256_ecdsa::validate_public_key(&sec1).is_ok());
+        assert_eq!(
+            p256_ecdsa::validate_public_key(&[0u8; 10]),
+            Err(Error::BadPublicKey)
+        );
     }
 
     #[test]

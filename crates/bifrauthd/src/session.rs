@@ -50,10 +50,21 @@ impl Policy {
     }
 }
 
-/// Resolves a username to its uid and verifies the correspondence (confused-deputy guard, ipc-design §3).
+/// A resolved account identity from the system database (NSS). The `canonical_username` is the account
+/// record's own name (`pw_name`), which may differ from the requested alias; the challenge binds this
+/// canonical name together with `uid` from the *same* lookup (confused-deputy guard, ipc-design §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedIdentity {
+    pub uid: u32,
+    pub canonical_username: String,
+}
+
+/// Resolves a requested username to its authoritative NSS identity. Returns `None` when the name does not
+/// resolve — which, by initial-scope decision (plan §4.9), covers **both** "no such user" and a transient
+/// NSS error: both fail closed (no challenge; the connection closes and PAM falls back to the password).
+/// This affects availability/observability and PAM error classification, not auth-success safety.
 pub trait UserResolver {
-    /// Return the uid for `username`, or `None` if it does not resolve.
-    fn resolve(&self, username: &str) -> Option<u32>;
+    fn resolve(&self, username: &str) -> Option<ResolvedIdentity>;
 }
 
 /// Why a connection ended (for tests/audit; not sent on the wire).
@@ -122,15 +133,19 @@ where
     if !policy.service_allowed(&req.pam_service) {
         return Terminal::ClosedBeforeIssue(PreIssueReason::ServiceNotAllowed);
     }
-    let uid = match resolver.resolve(&req.username) {
-        Some(u) => u,
+    // Resolve to the authoritative NSS identity. The challenge binds the record's canonical name and uid
+    // (from the same lookup), not the requested alias — which is retained only for a non-security audit
+    // note if it differs.
+    let identity = match resolver.resolve(&req.username) {
+        Some(id) => id,
         None => return Terminal::ClosedBeforeIssue(PreIssueReason::UnknownUser),
     };
+    // (Audit hook: `req.username` vs `identity.canonical_username` mismatch would be logged here.)
 
     // --- Stage 2: issue the challenge (short lock). ---
     let ctx = ChallengeContext {
-        uid,
-        username: req.username.clone(),
+        uid: identity.uid,
+        username: identity.canonical_username,
         pam_service: req.pam_service.clone(),
         pam_tty: req.pam_tty.clone(),
         pam_rhost: req.pam_rhost.clone(),
@@ -555,8 +570,11 @@ mod tests {
 
     struct MapResolver(HashMap<String, u32>);
     impl UserResolver for MapResolver {
-        fn resolve(&self, username: &str) -> Option<u32> {
-            self.0.get(username).copied()
+        fn resolve(&self, username: &str) -> Option<ResolvedIdentity> {
+            self.0.get(username).map(|&uid| ResolvedIdentity {
+                uid,
+                canonical_username: username.to_string(),
+            })
         }
     }
 

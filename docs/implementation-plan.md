@@ -1,9 +1,9 @@
-# bifrauth 実装計画（ドラフト v0.4）
+# bifrauth 実装計画（ドラフト v0.5）
 
 **対象:** `docs/iphone-faceid-linux-pam-design.md`（v0.3.2）の実装
 **このドキュメントの範囲:** ソフトウェア構成、ディレクトリ構成、使用言語・技術、Linux/Mac の作業分担、実装フェーズの決定。詳細なプロトコル仕様は設計書に従う。
-**改訂:** v0.2 で codex レビュー第1巡の指摘（1〜9）を反映。v0.3 で第2巡の blocking（§4.2 の P-256 署名 API 固定）と軽微（§5 P3 の cross-platform 前提明示）、および第3巡の非blocking編集提案（§4.2 digest API 注記を将来判断事項へ移動）を反映。v0.4 でプロジェクト名 BifrAuth 採用に伴うコンポーネント改名（`bifrauthd` / `bifrauth-transport` / `bifrauthctl` / `pam_bifrauth` / 専用テスト PAM サービス `bifrauth-test`）を反映（技術的内容は不変、名前のみ。命名は `docs/naming.md`）。
-**レビュー状況:** v0.3 の内容は codex による3巡のクロスレビューで **承認済み**。v0.4 は改名のみで技術的内容は不変。
+**改訂:** v0.2 で codex レビュー第1巡の指摘（1〜9）を反映。v0.3 で第2巡の blocking（§4.2 の P-256 署名 API 固定）と軽微（§5 P3 の cross-platform 前提明示）、および第3巡の非blocking編集提案（§4.2 digest API 注記を将来判断事項へ移動）を反映。v0.4 でプロジェクト名 BifrAuth 採用に伴うコンポーネント改名（`bifrauthd` / `bifrauth-transport` / `bifrauthctl` / `pam_bifrauth` / 専用テスト PAM サービス `bifrauth-test`）を反映（技術的内容は不変、名前のみ。命名は `docs/naming.md`）。**v0.5 で §4.9（identity 解決＝NSS/uzers、glibc 動的リンク前提・musl 静的非ゴール）を追加（ユーザー承認済み・2026-07-14）。codex 設計レビュー第1巡（uzers は不在/一時エラーを区別できないとの指摘）とユーザー決定（ローカル個人利用中心・uzers 維持・区別要件は外す）を反映し、canonical pw_name 束縛・逆引き不要・NSS/PAM timeout の配備要件・cache 不使用を追記。**
+**レビュー状況:** v0.3 の内容は codex による3巡のクロスレビューで **承認済み**。v0.4 は改名のみで技術的内容は不変。**v0.5 の §4.9 は codex 設計レビュー第2巡を依頼中。**
 
 ---
 
@@ -104,6 +104,39 @@ bifrauth/
 
 ### 4.8 初期スコープ（polkit 可否）
 - **まず専用 PAM サービスまで**を確実に完成。polkit / 1Password 統合は iPhone 実機が揃う Mac 段階（フェーズ7）。
+
+### 4.9 identity 解決（username→uid）とリンク方針（ユーザー承認済み・2026-07-14）
+- **username→uid の解決は NSS 経由**（PAM/login と**同一の権威データベース**）で行う。理由は confused-deputy
+  対策（ipc-design §3）: daemon が uid を wire 入力ではなく OS のアカウント DB から引き直し、
+  「この username は確かにこの uid」を保証してから challenge を発行する。`/etc/passwd` 直読みは不可
+  （SSSD/LDAP/AD ユーザーを取りこぼし、login 経路と判断がズレる）。
+- **依存クレート: `uzers` 0.12.2（最新安定版）**。libc 直（unsafe FFI）・nix（過大）ではなく uzers を採用
+  （安全・目的特化・**リエントラント `getpwnam_r`** 利用。マルチスレッドのワーカープールで必須）。
+  uzers 0.12.2 が `getpwnam_r`＋ERANGE バッファ倍増を使うことは codex レビューで確認済み。
+- **配備は glibc 動的リンク前提**（`x86_64-unknown-linux-gnu`、`+crt-static` を付けない）。
+  **musl 静的リンクは非ゴール**: musl は NSS プラグイン非対応で SSSD/LDAP/AD を解決できず、認証判断が
+  login 経路とズレるため。`pam_bifrauth` は `libpam` に load される cdylib で元々 glibc 動的であり、
+  daemon だけ musl 静的にしても一貫しない。配布は systemd unit + PAM 設定のパッケージ形態で、
+  「単一可搬静的バイナリ」は最初から配布モデルではない。
+- **スコープ: ローカル個人利用中心（ユーザー決定・2026-07-14）。** 主ターゲットはローカル `/etc/passwd`
+  ユーザーのワークステーション。SSSD/LDAP/AD は当面の主対象ではない。
+- **fail closed の割り当て（区別しない）**: uzers の `get_user_by_name` は `Option<User>` で、**「不在」と
+  「一時 NSS エラー（SSSD 応答不能等）」を両方 `None` に潰す**（codex 確認済み）。ローカル運用では一時エラーは
+  ほぼ発生しないため、**両者を区別せず一律 deny（challenge を発行せず接続を閉じる → PAM はパスワードへ
+  フォールバック）**とする。両方 fail closed（fail-open にならない）で、**認証成功の安全性には影響しない**が、
+  可用性・観測性・PAM エラー分類には影響する（区別を捨てるのは初期スコープでこの観測性/分類を諦める意味）。
+  - 区別が要る局面（SSSD 障害の観測性、`PAM_USER_UNKNOWN` と `PAM_AUTHINFO_UNAVAIL` の撃ち分け）は
+    **将来のエンタープライズ対応時の拡張**とする。その際は `libc::getpwnam_r` の薄い wrapper
+    （`Result<Option<_>, ResolveError>`）＋ wire の pre-issue エラー応答＋PAM 写像が必要（本タスク範囲外）。
+- **canonical identity**: 逆引き（`getpwuid_r` 往復）は**行わない**。uzers `User` の **`name()`（レコードの
+  canonical pw_name）と `uid()` をそのまま challenge の identity として束縛**する。理由: 逆引き必須化は
+  正当な alias/大小文字マッピングを拒否し、2 回の NSS lookup 間の TOCTOU を増やすため（codex 推奨）。
+  要求された username と canonical name が異なる場合は**機密でない監査イベント**とし、**同一 UID 束縛**を
+  security identity とする。
+- **可用性（配備要件）**: `getpwnam_r`/NSS は同期呼び出しで、**CLOCK_BOOTTIME の overall deadline では
+  SSSD/LDAP の hang を強制中断できない**。したがって「daemon の 30 秒が NSS を必ず中断する」とは書かない。
+  NSS/SSSD 側 timeout と **PAM 側 30 秒 timeout** を配備要件とする。resolver 呼び出しは verifier lock の外
+  （session で担保済み）。**negative cache / `UsersCache` は使わない**（認証 identity 変更の反映が遅れるため）。
 
 ---
 

@@ -18,6 +18,7 @@
 //! This core assumes registered device keys are already validated and non-revoked; revocation lives in the
 //! registry/CLI (task 0009).
 
+pub mod resolver;
 pub mod serve;
 pub mod session;
 pub mod systemd;

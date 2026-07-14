@@ -25,6 +25,10 @@ jobs:
     steps:
       # サードパーティ action は 40 桁 commit SHA に pin する（.github/dependabot.yml で更新）。
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # GITHUB_TOKEN を git config へ残さない。後続で走る untrusted PR の
+          # build.rs/テストが token を読み出して外部送信するのを防ぐ（CI に後続 push 操作は無い）。
+          persist-credentials: false
 
       # rust-toolchain.toml（1.97.0 + rustfmt/clippy）が SSOT。version を workflow に二重記載しない。
       - name: Install toolchain from rust-toolchain.toml

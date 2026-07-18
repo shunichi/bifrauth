@@ -117,3 +117,26 @@ Claude Code なら `/agmsg send <相手> "<本文>"`、Codex なら `$agmsg send
   `/agmsg spawn codex codex` / `$agmsg spawn claude-code claude`）。
 - agmsg のメッセージ本文はそのまま相手の文脈に注入される。信頼できる相手（このマシン上の
   自分のエージェント）とのみ運用する。
+
+### メッセージ送信後に相手を起こす（`herdr pane run`）
+
+agmsg でメッセージを送っても、相手が herdr 上で idle（在席だがターン未開始）だと、次のターンまで
+読まれない。**相手を起こす必要があるかは相手が誰かで変わる**:
+
+- **相手が codex のとき → 起こす必要がある。** codex のペインへ **`herdr pane run <pane_id> '$agmsg'`**
+  を送る（`$agmsg` で codex が inbox を確認し、届いたメッセージを処理してターンを開始する）。
+- **相手が claude（Claude Code）のとき → 起こす必要はない。** claude は inbox を常時 monitor して
+  いるので、送れば自動的に届く。
+
+補足:
+
+- **`herdr pane send-text` + `send-keys Enter` は使わない。** 入力欄にテキストが残るだけで確定
+  されないことがある。ペインへのプロンプト投入・確定は **`herdr pane run`** に任せる。
+- 相手ペインの `pane_id` は `herdr agent list`（`agent` と `cwd` で相手を特定）で調べる。
+- レビュー依頼など具体的な指示を添えて起こしてもよい。例:
+
+  ```
+  herdr pane run <codex-pane-id> '$agmsg のレビュー依頼が届いています。inbox を確認して docs/<file>.md をレビューし、結果を claude に返信してください。'
+  ```
+
+- 相手（codex）からの返信は、こちら（claude）が monitor している agmsg inbox 経由で自動的に届く。

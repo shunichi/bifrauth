@@ -24,6 +24,7 @@
 - **root**：UID `0` を持つ管理者。通常のパーミッション判定をほぼ素通りする。
 - **プロセス（process）**：実行中のプログラム。権限は（実効）UID を単位に判断される。
 - **実効 UID（effective UID）**：カーネルがアクセス可否の判断に使う UID。本書では簡略化して単に「プロセスの UID」と呼ぶことがある。
+- **資格情報（credentials）**：プロセスの UID・GID など、カーネルが権限判断に使う素性の情報。`SO_PEERCRED` が返すのもこれ。
 - **ファイルディスクリプタ（file descriptor）**：プロセスが開いたファイルやソケットを参照する小さな整数。
 - **パーミッション（permission）／mode**：ファイルの owner／group／other に対する read／write／execute の許可設定。
 - **DAC（任意アクセス制御、discretionary access control）**：所有者と mode でアクセスを決める方式。
@@ -59,6 +60,7 @@
 ## PAM
 
 - **PAM（Pluggable Authentication Modules）**：Linux の着脱可能な認証の仕組み。
+- **アプリケーション（application）**：PAM に本人確認を依頼する側（`login`／`sudo`／`polkit-agent-helper-1` など）。
 - **モジュール（module）**：PAM に差し込む、実際に確かめる処理を担う `.so`。
 - **conversation**：モジュールがユーザーと言葉をやり取りするための通り道。アプリケーションが提供する。
 - **管理グループ（management group）**：auth／account／password／session の四区分。

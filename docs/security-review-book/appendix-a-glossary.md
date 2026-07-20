@@ -104,10 +104,17 @@
 
 ## データ表現
 
-- **正規化（canonicalization／normalization）**：実装が違っても同じバイト列になるよう、表現を一意に定めること。
+- **正規化（canonicalization）**：エンコーディングで、実装が違っても同じ値が同じバイト列になるよう表現を一意に定めること（決定論的 CBOR など）。次の Unicode 正規化とは別の話。
+- **Unicode 正規化（Unicode normalization）**：Unicode の文字列について、正準等価な複数の表現を一つに揃えること（NFC など）。見た目が似ただけの別文字は揃えない。
+- **バイト列の一致（byte-exact match）**：意味の一致ではなく、バイト単位で完全に同じであること。署名の前提。
 - **canonical challenge**：正規化済みの問いかけのバイト列。署名の対象。
+- **CBOR（Concise Binary Object Representation）**：JSON に似た構造をバイナリで表す形式。
 - **決定論的 CBOR（deterministic CBOR）**：同じ値が必ず同じバイト列になるよう規則を絞った CBOR。
+- **allowlist（許可リスト）**：使ってよいもの（型など）だけを列挙し、それ以外を拒否する方式。
+- **NFC（Unicode 正規化形式 C、Normalization Form C）**：正準等価な文字表現（合成済みの「é」と「e＋結合アクセント」など）を一意のバイト列へ揃える Unicode 正規化形式。見た目が似ただけの別文字（homoglyph）は揃えない。
+- **message_type**：メッセージの種別を表す識別子。スキーマを変えるときは新しい値にする（例 `bifrauth.challenge.v2`）。
 - **downgrade 攻撃（downgrade attack）**：より弱い版・方式へ引き下げさせる攻撃。
+- **fail-closed（フェイルクローズ）**：判断に迷う・異常が起きたとき、安全側に倒して拒否・停止する設計。反対は fail-open。
 
 ## ローカル IPC とファイル
 

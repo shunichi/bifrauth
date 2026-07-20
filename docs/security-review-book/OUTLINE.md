@@ -135,7 +135,7 @@
 - **永続化の安全性:** atomic rename、fsync、crash consistency、tombstone / rollback
 - （クイズ）
 
-### 第 7 章 バイト列を一致させる技術 — 正規化・CBOR・バージョン交渉
+### 第 7 章 バイト列を一致させる技術 — 正規化・CBOR・バージョン付け
 - なぜ「署名対象のバイト列」が実装間で一致しないと困るか
 - deterministic CBOR、正規化の落とし穴（キー順・重複キー・数値表現・NFC）
 - **未知フィールド・重複キーを fail-closed で拒否**する
